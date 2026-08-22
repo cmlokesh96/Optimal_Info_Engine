@@ -115,14 +115,20 @@ def save_session(result: dict, DataSync: np.ndarray,
     Mirrors MATLAB:
         save([path '_xm_..._Data.mat'], 'pos', 'DataSync', 'pExp')
 
-    params (protocol_dt_s, T_relax_s, xth_nm, delta_t_s, ...) is pickled
-    alongside the three arrays — a later work/thermodynamics calculation
-    needs it to know, per fire (pos[:,3] code + tvec -> AI sample index),
-    where that protocol's window ends (+protocol_dt_s*ai_rate samples) and
-    that everything from there until the next checkpoint is the waiting
-    window (T_relax_s) where work is zero by construction (ao0=0, ao1
-    constant - the trap doesn't move) - without it, that reconstruction
-    needs the session's parameters remembered/re-typed from elsewhere.
+    params (protocol_dt_s, T_relax_s, xth_nm, delta_t_s, ...), active_states,
+    and protocols_loaded (sorted list of states that had a real analytical
+    protocol, or None) are pickled together alongside the three arrays — a
+    later work/thermodynamics calculation needs params to know, per fire
+    (pos[:,3] code + tvec -> AI sample index), where that protocol's window
+    ends (+protocol_dt_s*ai_rate samples) and that everything from there
+    until the next checkpoint is the waiting window (T_relax_s) where work
+    is zero by construction (ao0=0, ao1 constant - the trap doesn't move).
+    active_states/protocols_loaded resolve a real ambiguity in pos[:,3]
+    alone: a decide checkpoint's code is the DECODED state whether or not
+    it fired (see run_session_2ch's should_fire) - only a code for a state
+    that was both in active_states (or active_states was None) AND in
+    protocols_loaded (or protocols_loaded was None) is proof of an actual
+    fire.
 
     For .mat compatibility use scipy.io.savemat instead of np.save.
     """
@@ -135,7 +141,11 @@ def save_session(result: dict, DataSync: np.ndarray,
     np.save(f"{base}_DataSync.npy", DataSync)
     np.save(f"{base}_ai_data.npy",  result["ai_data"])
     with open(f"{base}_params.pkl", "wb") as f:
-        pickle.dump(params, f)
+        pickle.dump({
+            "params"          : params,
+            "active_states"   : result.get("active_states"),
+            "protocols_loaded": result.get("protocols_loaded"),
+        }, f)
     print(f"Saved: {base}_*.npy, {base}_params.pkl")
 
 
@@ -712,11 +722,17 @@ def run_session_2ch(params: SessionParams2Ch, ao, ai, camera, funcgen,
     print()
 
     return {
-        "pos"          : pos,
-        "ai_data"      : ai_data,
-        "channel_names": ai.channel_names,
-        "params"       : params,
-        "ao1_final_v"  : ao1_offset,
+        "pos"             : pos,
+        "ai_data"         : ai_data,
+        "channel_names"   : ai.channel_names,
+        "params"          : params,
+        "ao1_final_v"     : ao1_offset,
+        # Needed to tell "decoded state X" apart from "decoded state X AND it
+        # actually fired" from pos[:,3] alone in post-hoc analysis - a code
+        # is only proof of a fire if the state was also allowed to fire here
+        # (see should_fire's definition above).
+        "active_states"   : active_states,
+        "protocols_loaded": sorted(protocols) if protocols is not None else None,
     }
 
 

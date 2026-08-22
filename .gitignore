@@ -9,7 +9,7 @@ __pycache__/
 # Big/vendored folders inside the analytical sub-project - source lives in
 # requirements.txt/makefile; the venv and vendored numba copy are local
 # build artifacts, not project source.
-analytical_optimal_protocol_computation/.venv/
+analytical_optimal_protocol_computation/.venv
 analytical_optimal_protocol_computation/numba
 analytical_optimal_protocol_computation/project.zip
 

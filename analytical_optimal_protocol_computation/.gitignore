@@ -1,0 +1,10 @@
+ba_venv
+.venv
+__pycache__
+scripts/__pycache__
+sdesim/__pycache__
+parameters
+plots/optimal_protocols
+plots/optimal_protocols_multiple_measurement
+MA_comparison
+matlab_protocols

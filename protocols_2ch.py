@@ -58,7 +58,15 @@ class SessionParams2Ch:
     fps           : float          # camera frame rate (Hz)
     exposure_us   : float          # camera exposure time (us)
     xth_nm        : float = 50.0   # decode_symbol() threshold (nm)
-    delta_t_s     : float = 1.0    # spacing between the two decision samples (s)
+    delta_t_s     : float = 1.0    # spacing between the two decision samples (s).
+                                    # 0.0 triggers single-measurement mode in
+                                    # run_session_2ch(): no capture step, every
+                                    # checkpoint decides immediately using the
+                                    # SAME sample for both "prev" and "curr"
+                                    # (true simultaneity, matching the analytical
+                                    # protocols' t_second_measurement=0 - only
+                                    # the diagonal states (1,1)/(-1,-1)/(0,0)
+                                    # are ever decoded this way)
     T_relax_s     : float = 10.0   # equilibration wait AFTER the fired protocol
                                     # finishes, before resuming decisions (s) -
                                     # does NOT include protocol_dt_s; the total
@@ -95,6 +103,19 @@ class SessionParams2Ch:
     ai_rate       : int   = 3000   # AI sampling rate (S/s)
     ao_rate       : int   = 1000   # AO sampling rate (S/s)
     savepath      : str   = ""     # path prefix for saved files
+    fire_00_prob  : float = 0.0    # probability of firing the (0,0) protocol
+                                    # (a flat, zero-displacement waveform - a
+                                    # null/control measurement) each time
+                                    # (0,0) is decoded, independent of
+                                    # active_states - an unbiased Bernoulli
+                                    # thinning (not "every Nth occurrence",
+                                    # which could alias with any periodicity
+                                    # in when (0,0) happens to occur). 0.0
+                                    # (default) = never, today's behavior
+                                    # unchanged. When it fires, pos[:,3] gets
+                                    # ZERO_FIRE_CODE (not the usual (0,0)
+                                    # code) so it's distinguishable from an
+                                    # ordinary, non-fired (0,0) checkpoint.
 
     def __post_init__(self):
         # No T_relax_s >= protocol_dt_s constraint needed here anymore - the
@@ -152,6 +173,10 @@ STATE_TO_CODE = {
 }
 CODE_TO_STATE = {code: state for state, code in STATE_TO_CODE.items()}
 CAPTURE_CODE = 10   # checkpoint that only recorded x_prev, no decision made
+ZERO_FIRE_CODE = 11 # decoded (0,0) AND it fired (the rare null/control
+                    # measurement, see SessionParams2Ch.fire_00_prob) -
+                    # distinct from STATE_TO_CODE[(0,0)]=1 (an ordinary,
+                    # non-fired (0,0) checkpoint, still the common case)
 
 # ── Manual-test menu: digit key → state tuple ─────────────────────────────────
 # 0-7 = the 8 real (non-00) states, in the order they were first specified

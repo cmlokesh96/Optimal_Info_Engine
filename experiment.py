@@ -36,7 +36,7 @@ from scipy.signal import butter, filtfilt
 
 from protocols_2ch import (
     SessionParams2Ch, decode_state_pair, get_protocol_nm, split_channels,
-    STATE_TO_CODE, CODE_TO_STATE, CAPTURE_CODE,
+    STATE_TO_CODE, CODE_TO_STATE, CAPTURE_CODE, ZERO_FIRE_CODE,
     V_CENTER, NM_PER_VOLT,
 )
 from camera import NM_PER_PX
@@ -411,9 +411,10 @@ def run_session_2ch(params: SessionParams2Ch, ao, ai, camera, funcgen,
     Decision-timing model:
         Checkpoints alternate between "capture" (record x_prev only, no
         decision) and "decide" (decode_state_pair(x_prev, x_curr) -> real
-        decode, always). (0,0) -> no protocol fired; next checkpoint is a
-            fresh capture delta_frames later (skips the intermediate sample
-            entirely).
+        decode, always). (0,0) -> no protocol fired *unless the rare
+            fire_00_prob draw hits* (see below); ordinarily, next checkpoint
+            is a fresh capture delta_frames later (skips the intermediate
+            sample entirely).
         any other state -> protocol fired *only if active_states is None or
             the state is in active_states* (see below); next checkpoint is
             a capture protocol_frames + relax_frames later (the protocol's
@@ -423,6 +424,16 @@ def run_session_2ch(params: SessionParams2Ch, ao, ai, camera, funcgen,
             replaces delta_t for the first gap post-firing). If not in
             active_states, treated exactly like (0,0): no fire, next
             checkpoint is a capture delta_frames later.
+
+    params.fire_00_prob (default 0.0): independent of active_states, each
+        time (0,0) is decoded it fires (its own flat, zero-displacement
+        protocol - a null/control measurement) with this probability, via
+        an unbiased Bernoulli draw (not "every Nth occurrence" - avoids any
+        alias with periodicity in when (0,0) happens to occur). When it
+        fires, pos[:,3] gets ZERO_FIRE_CODE (11), not STATE_TO_CODE[(0,0)]
+        (1, an ordinary non-fired (0,0)) - and the SAME post-fire
+        protocol_frames + relax_frames cadence as any other fire applies,
+        so a full protocol_dt_s-long window of x(t) gets recorded for it.
 
     active_states: decode_state_pair() ALWAYS runs on the real tracked
         particle — this never overrides/forces a state. It only restricts
@@ -437,8 +448,19 @@ def run_session_2ch(params: SessionParams2Ch, ao, ai, camera, funcgen,
         protocol regardless of the particle's actual state, which biases
         them).
 
+    params.delta_t_s == 0.0: single-measurement mode - the capture step is
+        skipped entirely, and every checkpoint decides immediately using
+        that same frame's x for both "prev" and "curr" (decode_state_pair(
+        x, x, xth_nm), always exactly diagonal - only (1,1)/(-1,-1)/(0,0)
+        are ever produced). Matches the analytical protocols'
+        t_second_measurement=0 case (see analytical_protocols.py) - a real
+        two-sample pair doesn't exist when there's zero time between the
+        "two" measurements, so this measures the SAME instant twice rather
+        than approximating simultaneity with two adjacent camera frames.
+
     pos[:,3] is written on every checkpoint (decide -> STATE_TO_CODE[state]
-    1-9 — always the real decoded state, whether or not it fired — capture
+    1-9 — always the real decoded state, whether or not it fired, EXCEPT a
+    fired (0,0), which gets ZERO_FIRE_CODE (11) instead of code 1 — capture
     -> CAPTURE_CODE), 0 elsewhere, so it can be cross-checked directly
     against the ai3 (AdderOut) recording.
 
@@ -523,9 +545,18 @@ def run_session_2ch(params: SessionParams2Ch, ao, ai, camera, funcgen,
     pos = np.zeros((n_frames, 4), dtype=np.float64)
     # col: [time_s, x_nm, y_nm, trigger]
 
+    # delta_t_s == 0 -> single-measurement mode: no real "two samples apart"
+    # pair exists (t_second_measurement=0 in the analytical protocols is
+    # exactly this - the same instant measured "twice"), so every
+    # checkpoint decides immediately using that frame's own x for BOTH
+    # x_prev and x_curr (true simultaneity - not just two adjacent ~10ms
+    # camera frames, which would only approximate it) - the capture step is
+    # skipped entirely (is_capture stays False the whole session).
+    single_measurement = (params.delta_t_s == 0)
+
     ao1_offset : float       = ao1_start_v
     x_prev     : float | None = None
-    is_capture : bool        = True   # first checkpoint just captures x_prev
+    is_capture : bool        = not single_measurement   # first checkpoint just captures x_prev (skipped in single-measurement mode)
     next_frame : int         = 0
     frame_i    : int         = 0
 
@@ -539,6 +570,7 @@ def run_session_2ch(params: SessionParams2Ch, ao, ai, camera, funcgen,
     no_fire_count   : int         = 0    # print_every throttle, no-fire decisions only
     fire_count      : int         = 0    # print_every throttle, fire decisions only
     fire_latencies_s: list[float] = []   # decision -> ao.start(), per fire
+    rng = np.random.default_rng()        # for the fire_00_prob Bernoulli draw
 
     # Per-phase timing — purely diagnostic (see the end-of-session summary):
     # answers "is grab/find/fire actually keeping up with 1/fps?" with real
@@ -604,20 +636,33 @@ def run_session_2ch(params: SessionParams2Ch, ao, ai, camera, funcgen,
 
             # ── Decide checkpoint (real decode, always) ─────────────────────────
             x_curr = x_nm
+            if single_measurement:
+                x_prev = x_nm   # same instant, both "sides" of the pair - see single_measurement's definition above
             state  = decode_state_pair(x_prev, x_curr, params.xth_nm)
             pos[frame_i, 3] = STATE_TO_CODE[state]
 
-            should_fire = (state != (0, 0)) and (
+            should_fire_real = (state != (0, 0)) and (
                 active_states is None or state in active_states
             ) and (
                 protocols is None or state in protocols
             )
+            # Independent of active_states/protocols - a separate,
+            # probability-gated path so (0,0) never needs to be added to
+            # active_states to become eligible. An unbiased Bernoulli draw
+            # each time (0,0) is decoded, not "every Nth occurrence" (see
+            # SessionParams2Ch.fire_00_prob's docstring for why).
+            should_fire_00 = (state == (0, 0)) and (params.fire_00_prob > 0) and (
+                rng.random() < params.fire_00_prob
+            )
+            should_fire = should_fire_real or should_fire_00
+            if should_fire_00:
+                pos[frame_i, 3] = ZERO_FIRE_CODE
 
             if not should_fire:
                 no_fire_count += 1
                 if params.print_no_fire and (no_fire_count % params.print_every == 0):
                     if state == (0, 0):
-                        why = ""
+                        why = ", fire_00 draw missed" if params.fire_00_prob > 0 else ""
                     elif active_states is not None and state not in active_states:
                         why = ", not in active_states"
                     elif protocols is not None and state not in protocols:
@@ -629,7 +674,7 @@ def run_session_2ch(params: SessionParams2Ch, ao, ai, camera, funcgen,
                           f"x_prev={x_prev:+7.1f}  x_curr={x_curr:+7.1f}  "
                           f"(no fire{why})")
                 next_frame = frame_i + params.delta_frames
-                is_capture = True
+                is_capture = not single_measurement   # single-measurement mode: next checkpoint decides immediately too
             else:
                 t_fire0 = time.perf_counter()
 
@@ -664,7 +709,7 @@ def run_session_2ch(params: SessionParams2Ch, ao, ai, camera, funcgen,
                 # relax_frames (the T_relax_s equilibration wait) - additive,
                 # not overlapping (see SessionParams2Ch.T_relax_s's docstring).
                 next_frame = frame_i + params.protocol_frames + params.relax_frames
-                is_capture = True
+                is_capture = not single_measurement   # single-measurement mode: next checkpoint decides immediately too
 
     except KeyboardInterrupt:
         print("\nStopped early.")

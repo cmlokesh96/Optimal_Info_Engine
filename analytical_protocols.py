@@ -34,8 +34,23 @@ import numpy as np
 # daq, camera) uses everywhere.
 POSITION_SCALE_M_TO_NM = 1e9
 
-# The 8 real (non-no-op) states any complete protocol set must cover.
+# The 8 real (non-no-op) states any complete TWO-measurement protocol set
+# must cover.
 REAL_STATES = [(1, 1), (1, 0), (0, 1), (-1, 1), (-1, -1), (-1, 0), (0, -1), (1, -1)]
+
+# For t_second_measurement=0 (single-measurement / delta_t=0 sessions - see
+# experiment.py::run_session_2ch's single_measurement mode): only the
+# diagonal is ever meaningful (m_0 == m_t is a tautology when there's zero
+# time between the "two" measurements). This list is ONLY the two REAL
+# fired-by-decode states - it deliberately excludes (0,0), which needs no
+# separate listing here: (0,0) is always inserted as the same all-zeros
+# no-op regardless of which files matched (see below), and
+# run_session_2ch's rare-fire mechanism (SessionParams2Ch.fire_00_prob,
+# the same unbiased Bernoulli draw as the two-measurement case) applies
+# identically and automatically in single-measurement mode too - state ==
+# (0,0) there is a real, legitimate decode outcome
+# (decode_state_pair(x, x, xth_nm) when |x| <= xth_nm), not a special case.
+SINGLE_MEASUREMENT_STATES = [(1, 1), (-1, -1)]
 
 
 def _fmt(x):
@@ -43,7 +58,8 @@ def _fmt(x):
     return f"{x:g}".replace(".", "p").replace("-", "neg")
 
 
-def load_analytical_protocols(save_dir, t_second_measurement, t_protocol_end, ao_rate):
+def load_analytical_protocols(save_dir, t_second_measurement, t_protocol_end, ao_rate,
+                              real_states=None):
     """
     Load every saved (m_0, m_t) optimal protocol for one analytical
     parameter point and resample lambda(t) onto the AO hardware's sample
@@ -61,6 +77,12 @@ def load_analytical_protocols(save_dir, t_second_measurement, t_protocol_end, ao
         AO hardware sample rate (Hz). Returned waveforms have length
         int(t_protocol_end * ao_rate), matching NICardOutDual's n_samples
         and what split_channels()/ao.load() expect.
+    real_states : list[(int, int)], optional
+        Which non-(0,0) states to check for and warn about if missing -
+        defaults to the module's REAL_STATES (the 8 two-measurement
+        states). Pass SINGLE_MEASUREMENT_STATES ([(1,1), (-1,-1)]) when
+        t_second_measurement=0 - otherwise this would spuriously warn about
+        6 off-diagonal states that were never expected to have files at all.
 
     Returns
     -------
@@ -109,7 +131,7 @@ def load_analytical_protocols(save_dir, t_second_measurement, t_protocol_end, ao
 
         protocols[(m_0, m_t)] = -lambda_resampled_nm  # trap-frame -> stage-frame
 
-    missing = [s for s in REAL_STATES if s not in protocols]
+    missing = [s for s in (real_states if real_states is not None else REAL_STATES) if s not in protocols]
     if missing:
         print(f"load_analytical_protocols: no saved file for {missing} "
               f"(negligible probability at this parameter point?) — these "

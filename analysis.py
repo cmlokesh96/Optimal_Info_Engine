@@ -142,18 +142,29 @@ def extract_protocol_events(pos: np.ndarray, params, states=None,
     and this asserts every requested state could really have fired under
     them - not just trusts the code.
 
+    (0,0) is handled separately from the other 8 states throughout: it's
+    gated only by params.fire_00_prob (independent of active_states/
+    protocols_loaded - see SessionParams2Ch.fire_00_prob), and a fired
+    (0,0) is marked with ZERO_FIRE_CODE, not STATE_TO_CODE[(0,0)] (which
+    remains the code for an ordinary, non-fired (0,0) checkpoint - still
+    the common case, and NOT what this function extracts for (0,0)).
+
     Parameters
     ----------
     pos     : the session's pos array (n_frames, 4).
-    params  : that session's SessionParams2Ch (need .fps, .protocol_frames).
+    params  : that session's SessionParams2Ch (need .fps, .protocol_frames,
+        .fire_00_prob).
     states  : iterable of (m_0, m_t) tuples to extract, or None (default) to
         auto-resolve: all 8 real (non-(0,0)) states, narrowed by
         active_states/protocols_loaded if those aren't None either - i.e.
         active_states=None (the session's own "full engine, every state can
-        fire" convention) means every state gets extracted here too.
+        fire" convention) means every state gets extracted here too. (0,0)
+        is included in this auto-resolution only if params.fire_00_prob > 0
+        (otherwise it could never have fired, so there's nothing to extract).
     active_states, protocols_loaded : from the run_session_2ch() result dict
         (or the saved _params.pkl) - None means "no restriction" (matches
-        run_session_2ch's own None-means-unrestricted convention).
+        run_session_2ch's own None-means-unrestricted convention). Neither
+        applies to (0,0) - see above.
 
     Returns
     -------
@@ -163,9 +174,10 @@ def extract_protocol_events(pos: np.ndarray, params, states=None,
         A state with zero real occurrences gets an (0, protocol_frames)
         x_nm - not an error, just nothing to average/plot for it.
     """
-    from protocols_2ch import STATE_TO_CODE
+    from protocols_2ch import STATE_TO_CODE, ZERO_FIRE_CODE
 
     real_states = [s for s in STATE_TO_CODE if s != (0, 0)]
+    fire_00_prob = getattr(params, "fire_00_prob", 0.0)
 
     if states is None:
         states = real_states
@@ -173,11 +185,20 @@ def extract_protocol_events(pos: np.ndarray, params, states=None,
             states = [s for s in states if s in active_states]
         if protocols_loaded is not None:
             states = [s for s in states if s in protocols_loaded]
+        if fire_00_prob > 0:
+            states = states + [(0, 0)]
     else:
         # Explicit states are still validated - an explicitly-requested
         # state that couldn't possibly have fired is almost always a
         # mistake, not something to silently drop.
         for state in states:
+            if state == (0, 0):
+                if fire_00_prob <= 0:
+                    raise ValueError(
+                        "(0,0) was requested but this session's "
+                        "fire_00_prob was 0 - it could never have fired."
+                    )
+                continue
             if active_states is not None and state not in active_states:
                 raise ValueError(
                     f"{state} was not in this session's active_states "
@@ -197,7 +218,7 @@ def extract_protocol_events(pos: np.ndarray, params, states=None,
 
     out = {}
     for state in states:
-        code = STATE_TO_CODE[state]
+        code = ZERO_FIRE_CODE if state == (0, 0) else STATE_TO_CODE[state]
         frame_idx = np.flatnonzero(pos[:, 3] == code)
         # Drop events truncated by the session ending before protocol_dt_s
         # had time to fully elapse - can't fill a full row for those.

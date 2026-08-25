@@ -248,6 +248,26 @@ def load_session_files(prefix: str) -> dict:
     }
 
 
+def load_combined_calib_pos_px(folder: str) -> np.ndarray:
+    """
+    Stack every *_calib_pos_px.npy file in folder (as saved by
+    experiment.calibrate_trap_center(savepath=...), one file per run) into
+    one combined array - more pooled frames give a statistically better
+    trap-center estimate and a better-sampled potential than any single
+    calibration run alone.
+
+    Columns match calibrate_trap_center()'s own calib_pos_px exactly:
+    [x_px, y_px, time_s]. Column 2 (time_s) is each run's own relative time
+    from ITS OWN start, not a continuous timeline across runs - fine for
+    the position-only statistics this feeds (trap-center mean, potential
+    histogram), not for time-series plotting spanning multiple runs.
+    """
+    files = sorted(glob.glob(os.path.join(folder, "*_calib_pos_px.npy")))
+    if not files:
+        raise FileNotFoundError(f"No *_calib_pos_px.npy files found in {folder}")
+    return np.concatenate([np.load(f) for f in files], axis=0)
+
+
 def _merge_events(combined: dict, new: dict) -> None:
     """Concatenate new's per-state x_nm/frame_idx onto combined, in place -
     t_s must agree across everything merged (same protocol_dt_s/fps), since

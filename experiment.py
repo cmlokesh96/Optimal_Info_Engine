@@ -25,6 +25,7 @@ Mirrors MATLAB:
     save(..., 'pos', 'DataSync', 'pExp')
 """
 
+import os
 import time
 import pickle
 import threading
@@ -761,6 +762,21 @@ def run_batch_2ch(base_kwargs: dict, experiment_overrides: list[dict],
     base_kwargs         : SessionParams2Ch fields shared by every experiment
                           (fps, exposure_us, x_center_nm, y_center_nm,
                           protocol_dt_s, T_relax_s, ai_rate, ao_rate, savepath).
+                          savepath here is the BATCH FOLDER (created via
+                          os.makedirs if it doesn't exist, e.g.
+                          r"D:/data/batch01") - not a bare file prefix like
+                          run_session_2ch/SessionParams2Ch.savepath normally
+                          is elsewhere. Every experiment's own SessionParams2Ch
+                          gets savepath=os.path.join(batch_folder, f"exp{ii}")
+                          instead, so all N experiments' _pos.npy/_DataSync.npy/
+                          _ai_data.npy/_params.pkl files land together inside
+                          one folder - not as same-directory siblings sharing
+                          only a filename prefix (which is what happened
+                          before this - a real gap: nothing grouped a batch's
+                          files together for later combined analysis). See
+                          analysis.py's extract_protocol_events_from_folder()/
+                          _from_folders() for pooling statistics across every
+                          experiment in one (or several) such folders.
     experiment_overrides : list of N dicts, each overriding just what varies
                           per experiment (xth_nm, delta_t_s, trecord_s, ...) —
                           mirrors MATLAB pExp.xm=[...]/pExp.tau=[...] without
@@ -799,19 +815,26 @@ def run_batch_2ch(base_kwargs: dict, experiment_overrides: list[dict],
     results = []
     ao1_v = ao1_start_v
 
+    batch_folder = base_kwargs.get("savepath", "")
+    if batch_folder:
+        os.makedirs(batch_folder, exist_ok=True)
+
     for ii, overrides in enumerate(experiment_overrides, start=1):
         print(f"\n{'='*60}")
         print(f" Experiment {ii}/{n}")
         print(f"{'='*60}")
 
-        params = SessionParams2Ch(**base_kwargs, **overrides)
+        exp_kwargs = dict(base_kwargs)
+        if batch_folder:
+            exp_kwargs["savepath"] = os.path.join(batch_folder, f"exp{ii}")
+        params = SessionParams2Ch(**exp_kwargs, **overrides)
 
         result = run_session_2ch(params, ao, ai, camera, funcgen, ao1_start_v=ao1_v,
                                  protocols=protocols)
         ao1_v = result["ao1_final_v"]
 
         DataSync, tvec = build_datasync(result)
-        save_session(result, DataSync, suffix=f"_exp{ii}")
+        save_session(result, DataSync)   # exp{ii} is now baked into savepath itself
 
         n_decisions = int(np.sum((result["pos"][:, 3] >= 1) & (result["pos"][:, 3] <= 9)))
         print(f" Experiment {ii}/{n} done: {n_decisions} decisions  "

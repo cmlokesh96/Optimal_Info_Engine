@@ -13,6 +13,9 @@ number than left as a kT-normalized ratio — that conversion needs a
 temperature (default 298 K, override via T_K).
 """
 
+import os
+import glob
+import pickle
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.ticker import AutoMinorLocator
@@ -209,6 +212,114 @@ def extract_protocol_events(pos: np.ndarray, params, states=None,
     return out
 
 
+# ── Batch-folder loading and cross-experiment pooling ─────────────────────────
+# run_batch_2ch() (experiment.py) now saves every experiment of a batch into
+# ONE folder (savepath=os.path.join(batch_folder, f"exp{ii}")) instead of
+# same-directory siblings sharing only a filename prefix - these three
+# functions are what actually pools statistics across all of a batch's
+# hour-long experiments (or across several batch folders), rather than
+# analyzing one saved file at a time.
+
+def discover_session_files(folder: str) -> list:
+    """
+    Every saved session's shared file-prefix inside folder (each has a
+    matching _pos.npy/_params.pkl pair from save_session()) - sorted so
+    exp1, exp2, ... load back in the order they were run.
+    """
+    pos_files = sorted(glob.glob(os.path.join(folder, "*_pos.npy")))
+    return [p[:-len("_pos.npy")] for p in pos_files]
+
+
+def load_session_files(prefix: str) -> dict:
+    """
+    Load one saved session's pos + params + active_states + protocols_loaded
+    back from its _pos.npy/_params.pkl pair, given the shared prefix
+    discover_session_files() returns (or build one by hand: the exact string
+    save_session() used before appending "_pos.npy"/"_params.pkl").
+    """
+    pos = np.load(f"{prefix}_pos.npy")
+    with open(f"{prefix}_params.pkl", "rb") as f:
+        meta = pickle.load(f)
+    return {
+        "pos": pos,
+        "params": meta["params"],
+        "active_states": meta["active_states"],
+        "protocols_loaded": meta["protocols_loaded"],
+    }
+
+
+def _merge_events(combined: dict, new: dict) -> None:
+    """Concatenate new's per-state x_nm/frame_idx onto combined, in place -
+    t_s must agree across everything merged (same protocol_dt_s/fps), since
+    a mismatch means these sessions aren't really comparable experiments."""
+    for state, data in new.items():
+        if state not in combined:
+            combined[state] = {"x_nm": [data["x_nm"]], "t_s": data["t_s"],
+                               "frame_idx": [data["frame_idx"]]}
+        else:
+            if not np.allclose(combined[state]["t_s"], data["t_s"]):
+                raise ValueError(
+                    f"Inconsistent protocol timing for {state} across "
+                    f"sessions being combined (different protocol_dt_s/fps?) "
+                    f"- these experiments aren't directly poolable."
+                )
+            combined[state]["x_nm"].append(data["x_nm"])
+            combined[state]["frame_idx"].append(data["frame_idx"])
+
+
+def _finalize_merge(combined: dict) -> dict:
+    protocol_frames = None
+    for state, data in combined.items():
+        protocol_frames = data["x_nm"][0].shape[1] if data["x_nm"] else protocol_frames
+    out = {}
+    for state, data in combined.items():
+        x_nm = (np.concatenate(data["x_nm"], axis=0) if data["x_nm"]
+               else np.empty((0, protocol_frames or 0)))
+        frame_idx = (np.concatenate(data["frame_idx"], axis=0) if data["frame_idx"]
+                    else np.empty((0,), dtype=int))
+        out[state] = {"x_nm": x_nm, "t_s": data["t_s"], "frame_idx": frame_idx}
+    return out
+
+
+def extract_protocol_events_from_folder(folder: str, states=None) -> dict:
+    """
+    Load every saved session in folder (one run_batch_2ch() batch's worth)
+    and pool their extract_protocol_events() results into one combined
+    per-state dict - x_nm rows from every experiment in the folder stacked
+    together, so e.g. 8 one-hour experiments' worth of a given state's real
+    fired events become one (n_total_events, protocol_frames) matrix instead
+    of 8 separate ones. states=None (default) auto-resolves per-session as
+    extract_protocol_events() does (each session's own active_states/
+    protocols_loaded), then pools across whatever the union of sessions covers.
+    """
+    combined: dict = {}
+    for prefix in discover_session_files(folder):
+        sess = load_session_files(prefix)
+        ev = extract_protocol_events(sess["pos"], sess["params"], states=states,
+                                     active_states=sess["active_states"],
+                                     protocols_loaded=sess["protocols_loaded"])
+        _merge_events(combined, ev)
+    return _finalize_merge(combined)
+
+
+def extract_protocol_events_from_folders(folders, states=None) -> dict:
+    """
+    Same pooling as extract_protocol_events_from_folder(), across several
+    batch folders at once (e.g. combining multiple 8-experiment batches run
+    on different days) - each folder's own sessions are still discovered/
+    loaded independently via discover_session_files()/load_session_files().
+    """
+    combined: dict = {}
+    for folder in folders:
+        for prefix in discover_session_files(folder):
+            sess = load_session_files(prefix)
+            ev = extract_protocol_events(sess["pos"], sess["params"], states=states,
+                                         active_states=sess["active_states"],
+                                         protocols_loaded=sess["protocols_loaded"])
+            _merge_events(combined, ev)
+    return _finalize_merge(combined)
+
+
 def lambda_trap_nm_for_state(state: tuple, t_s: np.ndarray, analytical_protocols: dict,
                              protocol_dt_s: float, ao_rate: int) -> np.ndarray:
     """
@@ -232,7 +343,7 @@ def compute_cumulative_work_kT(x_cam_nm: np.ndarray, lambda_trap_nm: np.ndarray,
     """
     Cumulative work W(t)/kT for one or more events of one state, using the
     RAW camera reading directly (no reconstruction of the trap-relative
-    particle coordinate needed) - derived as follows.
+    particle coordinate needed for the smooth part) - derived as follows.
 
     The camera sits in the lab frame, same as the (truly stationary) trap -
     but the particle's LAB-frame position already reflects the stage having
@@ -244,14 +355,39 @@ def compute_cumulative_work_kT(x_cam_nm: np.ndarray, lambda_trap_nm: np.ndarray,
     Standard stochastic-energetics work differential (moving-trap agent):
         dW = (dU/dlambda) dlambda = kappa*(lambda - X_true) dlambda
 
-    Substituting X_true = x_cam + lambda cancels every lambda term:
+    Substituting X_true = x_cam + lambda cancels every lambda term for the
+    SMOOTH part of the motion:
         dW = kappa*(lambda - x_cam - lambda) dlambda = -kappa * x_cam * dlambda
 
-    So W(t) = -kappa * integral_0^t x_cam(t') dlambda(t') - no X_true
-    reconstruction, and (since lambda(t) is a known deterministic curve, not
-    itself stochastic) this integral has no Ito/Stratonovich ambiguity: it's
-    an ordinary Riemann-Stieltjes integral of the real (stochastic) x_cam
-    against the known dlambda, evaluated by the trapezoidal rule below.
+    The initial jump (lambda_trap_nm[0] is already lambda(0+), the value
+    right after the protocol's instantaneous initial jump from lambda(0-)=0
+    - see analytical_protocols.py/visualization.py::_plot_lambda_jump) needs
+    separate, explicit handling: x_cam_nm[...,0] is recorded from
+    run_session_2ch's camera read taken BEFORE that fire's ao.load()/
+    ao.start() call, i.e. genuinely PRE-jump (x_cam(0-)) - so x_cam_nm and
+    lambda_trap_nm are NOT time-aligned at index 0, and naively diff-ing
+    lambda_trap_nm as-is silently drops the jump's own work contribution.
+
+    Since X_true never itself jumps (only lambda does), X_true(0) equals
+    x_cam_nm[...,0] exactly (lambda(0-)=0 at that pre-fire instant), which
+    gives a closed-form jump work (holding X_true fixed at its pre-fire
+    value across the jump, standard stochastic-energetics boundary term):
+        W_jump = kappa*(lambda(0+)^2/2 - X_true(0)*lambda(0+))
+    and a reconstructed "just after the jump" camera reading
+    (unmeasurable directly - camera doesn't sample fast enough to resolve
+    the ~1ms jump against its own ~10ms frame period):
+        x_cam(0+) = X_true(0) - lambda(0+)
+    used as the start of the first smooth trapezoidal step into
+    x_cam_nm[...,1]. Every step from index 1 onward is genuinely
+    post-jump and time-aligned, so the plain -kappa*x_cam*dlambda
+    trapezoidal sum applies there unmodified. (When lambda_trap_nm[0]==0 -
+    no jump for this state/protocol - W_jump and the reconstructed value
+    both reduce to their no-jump values automatically, no branching needed.)
+
+    Since lambda(t) is a known deterministic curve, not itself stochastic,
+    none of this integration has any Ito/Stratonovich ambiguity - it's an
+    ordinary Riemann-Stieltjes integral of the real (stochastic) x_cam
+    against the known dlambda.
 
     Parameters
     ----------
@@ -268,14 +404,25 @@ def compute_cumulative_work_kT(x_cam_nm: np.ndarray, lambda_trap_nm: np.ndarray,
     x_cam_nm = np.atleast_2d(x_cam_nm)
     x_m = x_cam_nm * 1e-9
     lambda_m = lambda_trap_nm * 1e-9
+    kT_J = K_BOLTZMANN_J_PER_K * T_K
+
+    lambda0_m = lambda_m[0]
+    X_true_0_m = x_m[:, 0]                              # = x_cam(0-), exact
+    jump_work_J = kappa_N_per_m * (lambda0_m**2 / 2 - X_true_0_m * lambda0_m)
+    x_cam_0_plus_m = X_true_0_m - lambda0_m             # reconstructed x_cam(0+)
+
+    x_ext_m = x_m.copy()
+    x_ext_m[:, 0] = x_cam_0_plus_m                      # only for the smooth integral below
 
     d_lambda_m = np.diff(lambda_m)                       # (protocol_frames-1,)
-    x_mid_m = 0.5 * (x_m[:, :-1] + x_m[:, 1:])           # trapezoidal midpoint
-    dW_J = -kappa_N_per_m * x_mid_m * d_lambda_m         # (n_events, protocol_frames-1)
+    x_mid_m = 0.5 * (x_ext_m[:, :-1] + x_ext_m[:, 1:])   # trapezoidal midpoint
+    dW_smooth_J = -kappa_N_per_m * x_mid_m * d_lambda_m  # (n_events, protocol_frames-1)
 
-    kT_J = K_BOLTZMANN_J_PER_K * T_K
     W_cum_kT = np.zeros_like(x_m)
-    W_cum_kT[:, 1:] = np.cumsum(dW_J, axis=1) / kT_J
+    if x_m.shape[1] > 1:
+        W_cum_kT[:, 1] = (jump_work_J + dW_smooth_J[:, 0]) / kT_J
+    if x_m.shape[1] > 2:
+        W_cum_kT[:, 2:] = W_cum_kT[:, 1:2] + np.cumsum(dW_smooth_J[:, 1:], axis=1) / kT_J
 
     return W_cum_kT.reshape(np.atleast_2d(x_cam_nm).shape if x_cam_nm.ndim > 1
                              else (x_cam_nm.shape[-1],))

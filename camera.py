@@ -35,7 +35,7 @@ NM_PER_PX = 16   # update after calibration
 # ---------------------------------------------------------------------------
 
 GAUSSIAN_KERNEL_SIZE = 60     # gaussianKernelSize
-THRES = 80.0                  # thres
+THRES = 50.0                  # thres
 SIZE = 9                      # size   (must be odd)
 
 def _build_kernel(n=GAUSSIAN_KERNEL_SIZE):

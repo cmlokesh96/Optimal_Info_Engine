@@ -110,7 +110,7 @@ def build_datasync(result: dict,
 
 # ── Save ───────────────────────────────────────────────────────────────────────
 def save_session(result: dict, DataSync: np.ndarray,
-                 suffix: str = "") -> None:
+                 suffix: str = "", protocols: dict[tuple[int, int], np.ndarray] | None = None) -> None:
     """
     Save pos, DataSync, ai_data, params to files.
     Mirrors MATLAB:
@@ -131,6 +131,18 @@ def save_session(result: dict, DataSync: np.ndarray,
     protocols_loaded (or protocols_loaded was None) is proof of an actual
     fire.
 
+    protocols: the actual (m_0, m_t) -> stage-frame waveform dict this
+    session fired with (e.g. analytical_protocols, or whatever was passed
+    to run_session_2ch()/run_batch_2ch()'s own protocols= arg) - when
+    given, pickled alongside params to {base}_protocols.pkl. This is what
+    later makes a saved session/batch self-contained: analysis can load
+    the EXACT protocol shapes this data was recorded with, independent of
+    whatever currently happens to be loaded in a notebook or sitting in
+    analytical_optimal_protocol_computation's output folder (which is NOT
+    append-only - reruns of the solver silently overwrite same-(t2, tf,
+    m_0, m_t) files). None (default) skips saving it - matches the old
+    behavior for callers that don't have/need this.
+
     For .mat compatibility use scipy.io.savemat instead of np.save.
     """
     import datetime
@@ -147,7 +159,12 @@ def save_session(result: dict, DataSync: np.ndarray,
             "active_states"   : result.get("active_states"),
             "protocols_loaded": result.get("protocols_loaded"),
         }, f)
-    print(f"Saved: {base}_*.npy, {base}_params.pkl")
+    saved_files = f"{base}_*.npy, {base}_params.pkl"
+    if protocols is not None:
+        with open(f"{base}_protocols.pkl", "wb") as f:
+            pickle.dump(protocols, f)
+        saved_files += f", {base}_protocols.pkl"
+    print(f"Saved: {saved_files}")
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -879,7 +896,7 @@ def run_batch_2ch(base_kwargs: dict, experiment_overrides: list[dict],
         ao1_v = result["ao1_final_v"]
 
         DataSync, tvec = build_datasync(result)
-        save_session(result, DataSync)   # exp{ii} is now baked into savepath itself
+        save_session(result, DataSync, protocols=protocols)   # exp{ii} is now baked into savepath itself
 
         n_decisions = int(np.sum((result["pos"][:, 3] >= 1) & (result["pos"][:, 3] <= 9)))
         print(f" Experiment {ii}/{n} done: {n_decisions} decisions  "

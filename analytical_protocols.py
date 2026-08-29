@@ -138,3 +138,55 @@ def load_analytical_protocols(save_dir, t_second_measurement, t_protocol_end, ao
               f"states will be absent from the returned dict.")
 
     return protocols
+
+
+def load_predicted_work_J(save_dir, t_second_measurement, t_protocol_end, real_states=None):
+    """
+    The analytical solver's own predicted mean work per (m_0, m_t) state -
+    each saved .npz's "mean_work" field (Joules, matches
+    sdesim.parameter_sweep.run_single_parameter_point()'s "optimal" -
+    confirmed against a real saved file: mean_work/kT lines up with this
+    codebase's own measured cumulative work to within ~1%), for use as a
+    reference line against the real (experimental) work plots - how much
+    work the optimal protocol was actually designed to extract for this
+    state, independent of anything measured.
+
+    Same file-glob/state-resolution convention as
+    load_analytical_protocols() (same save_dir/t_second_measurement/
+    t_protocol_end must be used for both, or the reference won't match
+    whatever protocols/xth_nm are actually loaded) - (0, 0) is always 0.0
+    (no-op state, no work by construction), not read from any file.
+
+    Returns
+    -------
+    dict[(int, int), float] - predicted mean work, Joules. A state with no
+    saved file (matches load_analytical_protocols()'s own "negligible
+    probability" case) is simply absent, same as there.
+    """
+    pattern = os.path.join(
+        save_dir,
+        f"t2_{_fmt(t_second_measurement)}_tf_{_fmt(t_protocol_end)}_m0_*_mt_*.npz",
+    )
+    paths = sorted(glob.glob(pattern))
+    if not paths:
+        raise FileNotFoundError(
+            f"No analytical protocol files matched {pattern!r} — check "
+            f"t_second_measurement/t_protocol_end match what "
+            f"run_single_parameter_point.py was actually run with."
+        )
+
+    predicted_work_J = {(0, 0): 0.0}
+    for path in paths:
+        with np.load(path) as data:
+            m_0 = int(round(float(data["m_0"])))
+            m_t = int(round(float(data["m_t"])))
+            if (m_0, m_t) == (0, 0):
+                continue  # keep the exact-zero above, not this file's numerical noise
+            predicted_work_J[(m_0, m_t)] = float(data["mean_work"])
+
+    missing = [s for s in (real_states if real_states is not None else REAL_STATES) if s not in predicted_work_J]
+    if missing:
+        print(f"load_predicted_work_J: no saved file for {missing} - "
+              f"these states will be absent from the returned dict.")
+
+    return predicted_work_J

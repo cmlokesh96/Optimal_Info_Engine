@@ -22,9 +22,9 @@ def main():
 
     # --- Specify the parameter point to run here ---
     x_thresh_sigma_multiple=1
-    params =  SystemVariables.create(kappa=2.9e-6, kappa_b=1e-6, gamma=0.34e-6, gamma_b =15e-6, T=298, k_B= constants.Boltzmann, x_thresh_sigma_multiple=x_thresh_sigma_multiple)
+    params =  SystemVariables.create(kappa=2.4e-6, kappa_b=1e-6, gamma=0.34e-6, gamma_b =15e-6, T=298, k_B= constants.Boltzmann, x_thresh_sigma_multiple=x_thresh_sigma_multiple)
     
-    t_second_measurement = 1
+    t_second_measurement = 0
     t_protocol_end = 3.0
     n_outcomes = 3
     reference_key = "jump_second_only"  # for the printed ratio: "jump_both", "jump_second_only", or "-V_trap"

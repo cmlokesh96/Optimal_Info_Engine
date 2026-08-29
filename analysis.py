@@ -174,6 +174,35 @@ def extract_protocol_events(pos: np.ndarray, params, states=None,
         A state with zero real occurrences gets an (0, protocol_frames)
         x_nm - not an error, just nothing to average/plot for it.
     """
+    states, t_s, protocol_frames, frame_idx_by_state = _resolve_fire_events(
+        pos, params, states, active_states, protocols_loaded)
+
+    out = {}
+    for state in states:
+        frame_idx = frame_idx_by_state[state]
+        x_nm = np.empty((len(frame_idx), protocol_frames))
+        for i, fi in enumerate(frame_idx):
+            x_nm[i] = pos[fi:fi + protocol_frames, 1]
+
+        out[state] = {"x_nm": x_nm, "t_s": t_s, "frame_idx": frame_idx}
+
+    return out
+
+
+def _resolve_fire_events(pos: np.ndarray, params, states, active_states, protocols_loaded):
+    """
+    Shared state-resolution/validation and frame_idx lookup behind
+    extract_protocol_events() and extract_protocol_stage_events() - see
+    extract_protocol_events()'s docstring for the states/active_states/
+    protocols_loaded semantics this implements.
+
+    Returns
+    -------
+    (states, t_s, protocol_frames, frame_idx_by_state) where
+    frame_idx_by_state[state] is the (n_events,) array of fire-start
+    frames for that state, already dropping events truncated by the
+    session ending before protocol_dt_s had time to fully elapse.
+    """
     from protocols_2ch import STATE_TO_CODE, ZERO_FIRE_CODE
 
     real_states = [s for s in STATE_TO_CODE if s != (0, 0)]
@@ -216,19 +245,59 @@ def extract_protocol_events(pos: np.ndarray, params, states=None,
     t_s = np.arange(protocol_frames) / params.fps
     n_frames = len(pos)
 
-    out = {}
+    frame_idx_by_state = {}
     for state in states:
         code = ZERO_FIRE_CODE if state == (0, 0) else STATE_TO_CODE[state]
         frame_idx = np.flatnonzero(pos[:, 3] == code)
         # Drop events truncated by the session ending before protocol_dt_s
         # had time to fully elapse - can't fill a full row for those.
         frame_idx = frame_idx[frame_idx + protocol_frames <= n_frames]
+        frame_idx_by_state[state] = frame_idx
 
-        x_nm = np.empty((len(frame_idx), protocol_frames))
+    return states, t_s, protocol_frames, frame_idx_by_state
+
+
+def extract_protocol_stage_events(pos: np.ndarray, DataSync: np.ndarray, params, states=None,
+                                  active_states=None, protocols_loaded=None) -> dict:
+    """
+    Same per-state event windowing as extract_protocol_events(), but pulls
+    the physical Stage-channel readback (DataSync[:,1], nm - see
+    experiment.py::build_datasync) instead of the camera x - i.e. what the
+    stage actually did, independent of camera tracking entirely. Diagnostic
+    for comparing against a loaded analytical protocol's stage-frame curve
+    (analytical_protocols[state], or -lambda_trap_nm_for_state(...)) without
+    touching x_nm/compute_cumulative_work_kT at all.
+
+    Each event's row is relative to that event's OWN pre-fire baseline
+    (DataSync[fi, 1], the stage voltage/position it happened to be sitting
+    at when this particular fire started - carried over from wherever the
+    previous fire's ao1 coarse offset left it) - so stage_nm[..., 0] == 0
+    for every row by construction, and later samples show the actual
+    stage displacement caused by THIS fire, comparable across events/states
+    regardless of each one's arbitrary starting offset.
+
+    Returns
+    -------
+    dict[state] -> {"stage_nm": (n_events, protocol_frames) ndarray,
+                    "t_s": (protocol_frames,) ndarray,
+                    "frame_idx": (n_events,) ndarray of fire-start frames}
+    """
+    states, t_s, protocol_frames, frame_idx_by_state = _resolve_fire_events(
+        pos, params, states, active_states, protocols_loaded)
+
+    stage_nm_all = DataSync[:, 1]
+    n = min(len(pos), len(DataSync))
+
+    out = {}
+    for state in states:
+        frame_idx = frame_idx_by_state[state]
+        frame_idx = frame_idx[frame_idx + protocol_frames <= n]
+
+        stage_nm = np.empty((len(frame_idx), protocol_frames))
         for i, fi in enumerate(frame_idx):
-            x_nm[i] = pos[fi:fi + protocol_frames, 1]
+            stage_nm[i] = stage_nm_all[fi:fi + protocol_frames] - stage_nm_all[fi]
 
-        out[state] = {"x_nm": x_nm, "t_s": t_s, "frame_idx": frame_idx}
+        out[state] = {"stage_nm": stage_nm, "t_s": t_s, "frame_idx": frame_idx}
 
     return out
 
@@ -253,20 +322,75 @@ def discover_session_files(folder: str) -> list:
 
 def load_session_files(prefix: str) -> dict:
     """
-    Load one saved session's pos + params + active_states + protocols_loaded
-    back from its _pos.npy/_params.pkl pair, given the shared prefix
-    discover_session_files() returns (or build one by hand: the exact string
-    save_session() used before appending "_pos.npy"/"_params.pkl").
+    Load one saved session's pos + DataSync + params + active_states +
+    protocols_loaded + protocols back from its _pos.npy/_DataSync.npy/
+    _params.pkl/_protocols.pkl files, given the shared prefix
+    discover_session_files() returns (or build one by hand: the exact
+    string save_session() used before appending
+    "_pos.npy"/"_DataSync.npy"/"_params.pkl"/"_protocols.pkl"). DataSync
+    and protocols are each None if their file isn't present (older saves,
+    or save_session() called without one).
     """
     pos = np.load(f"{prefix}_pos.npy")
+    DataSync = (np.load(f"{prefix}_DataSync.npy")
+               if os.path.exists(f"{prefix}_DataSync.npy") else None)
     with open(f"{prefix}_params.pkl", "rb") as f:
         meta = pickle.load(f)
+    protocols = None
+    if os.path.exists(f"{prefix}_protocols.pkl"):
+        with open(f"{prefix}_protocols.pkl", "rb") as f:
+            protocols = pickle.load(f)
     return {
         "pos": pos,
+        "DataSync": DataSync,
         "params": meta["params"],
         "active_states": meta["active_states"],
         "protocols_loaded": meta["protocols_loaded"],
+        "protocols": protocols,
     }
+
+
+def load_batch_protocols(folder: str) -> dict:
+    """
+    The (m_0, m_t) -> stage-frame waveform dict every session in a
+    run_batch_2ch() batch folder actually fired with, loaded from each
+    session's own saved _protocols.pkl (see save_session()'s protocols=
+    arg) - makes the batch folder self-contained: no dependency on
+    whatever's currently loaded in a notebook or sitting in
+    analytical_optimal_protocol_computation's output folder (which can
+    silently change - reruns of the solver overwrite same-(t2, tf, m_0,
+    m_t) files).
+
+    Every session in folder must have a saved _protocols.pkl (raises
+    FileNotFoundError otherwise - older batches predating this save need
+    a manually-loaded analytical_protocols dict instead, same as before),
+    and if there's more than one session, all their protocols must agree
+    exactly (raises ValueError otherwise - run_batch_2ch() only ever
+    passes one protocols dict through to every experiment in a batch, so
+    a mismatch means these sessions aren't really one batch).
+    """
+    protocols = None
+    for prefix in discover_session_files(folder):
+        path = f"{prefix}_protocols.pkl"
+        if not os.path.exists(path):
+            raise FileNotFoundError(
+                f"{path} not found - load_batch_protocols() needs every "
+                f"session in {folder!r} to have a saved _protocols.pkl "
+                f"(see save_session()'s protocols= arg)."
+            )
+        with open(path, "rb") as f:
+            this_protocols = pickle.load(f)
+        if protocols is None:
+            protocols = this_protocols
+        elif set(protocols) != set(this_protocols) or not all(
+            np.allclose(protocols[s], this_protocols[s]) for s in protocols
+        ):
+            raise ValueError(
+                f"{prefix}'s saved protocols don't match the rest of "
+                f"{folder!r} - these sessions weren't fired with the same "
+                f"protocol set, so they aren't really one batch."
+            )
+    return protocols
 
 
 def load_combined_calib_pos_px(folder: str) -> np.ndarray:
@@ -289,13 +413,16 @@ def load_combined_calib_pos_px(folder: str) -> np.ndarray:
     return np.concatenate([np.load(f) for f in files], axis=0)
 
 
-def _merge_events(combined: dict, new: dict) -> None:
-    """Concatenate new's per-state x_nm/frame_idx onto combined, in place -
-    t_s must agree across everything merged (same protocol_dt_s/fps), since
-    a mismatch means these sessions aren't really comparable experiments."""
+def _merge_events(combined: dict, new: dict, data_key: str = "x_nm") -> None:
+    """Concatenate new's per-state data_key/frame_idx onto combined, in
+    place - t_s must agree across everything merged (same protocol_dt_s/
+    fps), since a mismatch means these sessions aren't really comparable
+    experiments. data_key selects which per-event array is being pooled
+    ("x_nm" for extract_protocol_events(), "stage_nm" for
+    extract_protocol_stage_events())."""
     for state, data in new.items():
         if state not in combined:
-            combined[state] = {"x_nm": [data["x_nm"]], "t_s": data["t_s"],
+            combined[state] = {data_key: [data[data_key]], "t_s": data["t_s"],
                                "frame_idx": [data["frame_idx"]]}
         else:
             if not np.allclose(combined[state]["t_s"], data["t_s"]):
@@ -304,21 +431,21 @@ def _merge_events(combined: dict, new: dict) -> None:
                     f"sessions being combined (different protocol_dt_s/fps?) "
                     f"- these experiments aren't directly poolable."
                 )
-            combined[state]["x_nm"].append(data["x_nm"])
+            combined[state][data_key].append(data[data_key])
             combined[state]["frame_idx"].append(data["frame_idx"])
 
 
-def _finalize_merge(combined: dict) -> dict:
+def _finalize_merge(combined: dict, data_key: str = "x_nm") -> dict:
     protocol_frames = None
     for state, data in combined.items():
-        protocol_frames = data["x_nm"][0].shape[1] if data["x_nm"] else protocol_frames
+        protocol_frames = data[data_key][0].shape[1] if data[data_key] else protocol_frames
     out = {}
     for state, data in combined.items():
-        x_nm = (np.concatenate(data["x_nm"], axis=0) if data["x_nm"]
-               else np.empty((0, protocol_frames or 0)))
+        arr = (np.concatenate(data[data_key], axis=0) if data[data_key]
+              else np.empty((0, protocol_frames or 0)))
         frame_idx = (np.concatenate(data["frame_idx"], axis=0) if data["frame_idx"]
                     else np.empty((0,), dtype=int))
-        out[state] = {"x_nm": x_nm, "t_s": data["t_s"], "frame_idx": frame_idx}
+        out[state] = {data_key: arr, "t_s": data["t_s"], "frame_idx": frame_idx}
     return out
 
 
@@ -359,6 +486,32 @@ def extract_protocol_events_from_folders(folders, states=None) -> dict:
                                          protocols_loaded=sess["protocols_loaded"])
             _merge_events(combined, ev)
     return _finalize_merge(combined)
+
+
+def extract_protocol_stage_events_from_folder(folder: str, states=None) -> dict:
+    """
+    Same pooling as extract_protocol_events_from_folder(), but for the
+    physical Stage-channel readback (extract_protocol_stage_events()) -
+    every session in folder must have a saved DataSync (load_session_files()
+    raises KeyError-like access if a session is missing one; older saves
+    without DataSync should be pointed at extract_protocol_events_from_folder
+    instead, or excluded from folder).
+    """
+    combined: dict = {}
+    for prefix in discover_session_files(folder):
+        sess = load_session_files(prefix)
+        if sess["DataSync"] is None:
+            raise FileNotFoundError(
+                f"{prefix}_DataSync.npy not found - "
+                f"extract_protocol_stage_events_from_folder() needs every "
+                f"session in {folder!r} to have a saved DataSync."
+            )
+        ev = extract_protocol_stage_events(sess["pos"], sess["DataSync"], sess["params"],
+                                           states=states,
+                                           active_states=sess["active_states"],
+                                           protocols_loaded=sess["protocols_loaded"])
+        _merge_events(combined, ev, data_key="stage_nm")
+    return _finalize_merge(combined, data_key="stage_nm")
 
 
 def lambda_trap_nm_for_state(state: tuple, t_s: np.ndarray, analytical_protocols: dict,
@@ -469,6 +622,67 @@ def compute_cumulative_work_kT(x_cam_nm: np.ndarray, lambda_trap_nm: np.ndarray,
                              else (x_cam_nm.shape[-1],))
 
 
+def compute_work_split_kT(x_cam_nm: np.ndarray, lambda_trap_nm: np.ndarray,
+                          kappa_N_per_m: float, T_K: float) -> tuple:
+    """
+    Same total as compute_cumulative_work_kT(), but the jump's own
+    contribution is computed and returned as an explicit, separate
+    quantity instead of being folded into the cumulative curve's first
+    step.
+
+    W_jump is the same closed-form boundary term as
+    compute_cumulative_work_kT() (X_true held fixed at its pre-fire value
+    x_cam_nm[...,0] across the jump), except the jump's target is taken as
+    lambda_trap_nm[1] - the first sample that is actually, genuinely
+    time-aligned with a real camera reading (x_cam_nm[...,1]) - rather
+    than lambda_trap_nm[0] (already lambda(0+), but paired with
+    x_cam_nm[...,0]'s PRE-fire reading - see compute_cumulative_work_kT's
+    docstring on why those two aren't time-aligned at index 0). Past
+    index 1, nothing needs any reconstruction: the smooth part is the
+    plain -kappa*x_cam*dlambda trapezoidal sum over indices 1, 2, 3, ...
+    directly, real samples only.
+
+    Deliberately uses the protocol's OWN idealized landing frame (index 1),
+    not plot_trap_relative_grid()'s index-2 convention (which additionally
+    accounts for this hardware's confirmed extra ~1-frame actuation delay,
+    verified via the AI Stage-channel readback - see that function's
+    docstring). The two are intentionally different: plot_trap_relative_grid
+    exists to look visually continuous, and index 2 achieves that; this
+    function exists to be compared against the solver's own predicted
+    mean_work/mean_work_jump, and index 1 tracks that prediction more
+    closely in practice - there's no requirement that the plot and the
+    reported work numbers share one convention.
+
+    Parameters/Returns match compute_cumulative_work_kT() except the
+    return value is (W_jump_kT, W_total_kT):
+        W_jump_kT  : (n_events,) - the jump's own work, kT units.
+        W_total_kT : same shape as x_cam_nm - cumulative TOTAL work
+                    (jump + smooth), kT units, W_total[...,0] = 0.
+    """
+    x_cam_nm = np.atleast_2d(x_cam_nm)
+    x_m = x_cam_nm * 1e-9
+    lambda_m = lambda_trap_nm * 1e-9
+    kT_J = K_BOLTZMANN_J_PER_K * T_K
+
+    lambda_jump_target_m = lambda_m[1] if len(lambda_m) > 1 else lambda_m[0]
+    X_true_0_m = x_m[:, 0]                              # = x_cam(0-), exact
+    jump_work_J = kappa_N_per_m * (lambda_jump_target_m**2 / 2
+                                   - X_true_0_m * lambda_jump_target_m)
+    W_jump_kT = jump_work_J / kT_J
+
+    W_total_kT = np.zeros_like(x_m)
+    if x_m.shape[1] > 1:
+        W_total_kT[:, 1] = W_jump_kT
+    if x_m.shape[1] > 2:
+        d_lambda_m = np.diff(lambda_m[1:])                     # real samples only, from index 1 on
+        x_mid_m = 0.5 * (x_m[:, 1:-1] + x_m[:, 2:])            # real samples only, no reconstruction
+        dW_smooth_J = -kappa_N_per_m * x_mid_m * d_lambda_m
+        W_total_kT[:, 2:] = W_jump_kT[:, None] + np.cumsum(dW_smooth_J, axis=1) / kT_J
+
+    shape = np.atleast_2d(x_cam_nm).shape if x_cam_nm.ndim > 1 else (x_cam_nm.shape[-1],)
+    return W_jump_kT, W_total_kT.reshape(shape)
+
+
 def _grid_dims(n: int) -> tuple[int, int]:
     """Same layout rule as analytical_optimal_protocol_computation's own
     plot_optimal_trajectories_grid: as square as possible, extra panels
@@ -524,6 +738,119 @@ def plot_x_lambda_grid(events: dict, lambdas: dict) -> None:
     plt.show()
 
 
+def plot_trap_relative_grid(events: dict, lambdas: dict) -> None:
+    """
+    Same layout as plot_x_lambda_grid(), but avoids that plot's reference-
+    frame artifact: raw x_cam = X_true - lambda rides along with the
+    protocol's own initial jump (x_cam jumps too, by construction, not
+    because the particle moved - see compute_cumulative_work_kT's
+    docstring), which reads as an unphysical plunge right when lambda
+    fires. This plots the trap-relative X = x_cam + lambda instead -
+    lambda is added from index 2 onward only (matching
+    compute_work_split_kT's own jump convention: lambda_trap_nm[2] is the
+    first sample that's genuinely time-aligned with a real camera reading
+    - this hardware has a confirmed extra ~1-frame delay before the trap
+    actually starts moving, verified independently via the AI Stage-
+    channel readback, so indices 0 AND 1 are both still pre-jump - so X is
+    reconstructed post-jump from index 2 on; indices 0-1 are left as-is,
+    lambda(0-)=0 there so no addition is needed) - giving a continuous
+    curve showing what the particle actually did relative to the trap.
+
+    lambda(t) is plotted as the plain curve it is (already lambda(0+) from
+    its own first sample onward), with its own instantaneous initial jump
+    drawn as a separate dashed marker from (t=0, 0) up to (t=0, lambda(0+))
+    plus an open circle at the pre-jump rest point - same convention as
+    the notebook's own _plot_lambda_jump helper - and, like that helper,
+    with no legend entry of its own (it's just an annotation on the
+    already-labeled lambda curve, not a separate series).
+    """
+    states = list(events.keys())
+    n = len(states)
+    nrows, ncols = _grid_dims(n)
+    fig = plt.figure(figsize=(6.5 * ncols, 4.5 * nrows))
+
+    for i, state in enumerate(states):
+        ax = fig.add_subplot(nrows, ncols, i + 1)
+        _style_grid_axis(ax)
+        t_s = events[state]["t_s"]
+        x_nm = events[state]["x_nm"]
+        n_events = x_nm.shape[0]
+        ax.set_title(f"$m_0={state[0]}$, $m_t={state[1]}$  n={n_events}")
+
+        if n_events == 0:
+            ax.text(0.5, 0.5, "no events", ha='center', va='center', transform=ax.transAxes)
+            continue
+
+        lam = lambdas[state]
+        X_true_nm = x_nm.copy()
+        if len(lam) > 2:
+            X_true_nm[:, 2:] += lam[2:]
+
+        X_mean, X_std = X_true_nm.mean(axis=0), X_true_nm.std(axis=0)
+        ax.plot(t_s, X_mean, color="tab:blue", label="$\\langle X \\rangle$")
+        ax.fill_between(t_s, X_mean - X_std, X_mean + X_std, color="tab:blue", alpha=0.2)
+
+        ax.plot(t_s, lam, color="tab:green", label="$\\lambda$")
+        if len(lam) > 0 and lam[0] != 0:
+            ax.plot([t_s[0], t_s[0]], [0.0, lam[0]], color="tab:green", linestyle="--", lw=1.5)
+            ax.plot(t_s[0], 0.0, marker="o", ms=5, mfc="white", mec="tab:green", zorder=5)
+
+        ax.set_ylabel("Position (nm)")
+        ax.legend(fontsize=8)
+
+    fig.suptitle("Per-state protocol events: trap-relative $X$ and $\\lambda$")
+    plt.tight_layout(rect=[0, 0, 1, 0.97])
+    plt.show()
+
+
+def plot_stage_vs_protocol_grid(stage_events: dict, stage_protocol_nm: dict) -> None:
+    """
+    Diagnostic grid, same layout as plot_x_lambda_grid(): per state, the
+    mean relative Stage-channel readback (+/- std band, from
+    extract_protocol_stage_events()/_from_folder() - what the stage
+    actually did, zeroed to each event's own pre-fire baseline) overlaid
+    against the currently-loaded analytical protocol's stage-frame curve
+    (stage_protocol_nm[state] - pass -lambda_trap_nm_for_state(state, t_s,
+    analytical_protocols, protocol_dt_s, ao_rate) for each state, or
+    equivalently np.interp the raw analytical_protocols[state] AO waveform
+    onto t_s - analytical_protocols is already stage-frame, see
+    analytical_protocols.py). No camera data (x_nm) involved at all - a
+    mismatch here means the loaded protocol doesn't match what this batch's
+    hardware actually delivered, independent of any camera-tracking
+    question. Purely read-only/diagnostic - doesn't touch or depend on
+    compute_cumulative_work_kT or plot_x_lambda_grid.
+    """
+    states = list(stage_events.keys())
+    n = len(states)
+    nrows, ncols = _grid_dims(n)
+    fig = plt.figure(figsize=(6.5 * ncols, 4.5 * nrows))
+
+    for i, state in enumerate(states):
+        ax = fig.add_subplot(nrows, ncols, i + 1)
+        _style_grid_axis(ax)
+        t_s = stage_events[state]["t_s"]
+        stage_nm = stage_events[state]["stage_nm"]
+        n_events = stage_nm.shape[0]
+        ax.set_title(f"$m_0={state[0]}$, $m_t={state[1]}$  n={n_events}")
+
+        if n_events == 0:
+            ax.text(0.5, 0.5, "no events", ha='center', va='center', transform=ax.transAxes)
+            continue
+
+        s_mean, s_std = stage_nm.mean(axis=0), stage_nm.std(axis=0)
+        ax.plot(t_s, s_mean, color="tab:purple", label="Stage (measured)")
+        ax.fill_between(t_s, s_mean - s_std, s_mean + s_std, color="tab:purple", alpha=0.2)
+        if state in stage_protocol_nm:
+            ax.plot(t_s, stage_protocol_nm[state], color="tab:orange", ls="--",
+                   label="protocol (loaded)")
+        ax.set_ylabel("Relative stage position (nm)")
+        ax.legend(fontsize=8)
+
+    fig.suptitle("Measured Stage readback vs. loaded analytical protocol (stage frame)")
+    plt.tight_layout(rect=[0, 0, 1, 0.97])
+    plt.show()
+
+
 def plot_work_grid(events: dict, works_kT: dict, kappa_N_per_m: float, T_K: float) -> None:
     """
     One figure, one panel per state (from events' keys), same grid layout
@@ -553,6 +880,112 @@ def plot_work_grid(events: dict, works_kT: dict, kappa_N_per_m: float, T_K: floa
         ax.legend(fontsize=8)
 
     fig.suptitle(f"Per-state cumulative work  (kappa={kappa_N_per_m:.3e} N/m, T={T_K:.0f} K)")
+    plt.tight_layout(rect=[0, 0, 1, 0.97])
+    plt.show()
+
+
+def compute_trigger_energy_reference_kT(events: dict, kappa_N_per_m: float, T_K: float) -> dict:
+    """
+    -0.5*kappa*<x_trigger>^2 / kT per state - a naive "energy available at
+    the trigger instant" reference (negative trap potential, matching the
+    solver's own "-V_trap" reference key and this codebase's convention of
+    negative = work extracted), independent of the analytical solver
+    entirely (computed straight from events, i.e. real measured data).
+
+    x_trigger is events[state]["x_nm"][:, 0]: the raw camera reading at
+    the fire's own decide/trigger frame - x_cam(0-), recorded before that
+    fire's ao.load()/ao.start() call (see compute_cumulative_work_kT's
+    docstring). lambda(0-)=0 at that instant (the trap hasn't jumped yet),
+    so x_cam(0-) equals the trap-relative coordinate X_true(0-) exactly -
+    this is the same position (compared against xth_nm) that got this
+    state decoded and fired in the first place (e.g. for (1,1), the mean
+    of x_trigger across all its real fires is - by construction - some
+    value > xth_nm). Averaged ACROSS events first, then squared (matches
+    -0.5*kappa*mean(x)^2 as specified, not -0.5*kappa*mean(x^2)).
+
+    Returns
+    -------
+    dict[state] -> float, kT units. A state with zero events gets 0.0.
+    """
+    kT_J = K_BOLTZMANN_J_PER_K * T_K
+    reference_kT = {}
+    for state, data in events.items():
+        x_nm = data["x_nm"]
+        if x_nm.shape[0] == 0:
+            reference_kT[state] = 0.0
+            continue
+        x_trigger_m = x_nm[:, 0].mean() * 1e-9
+        reference_kT[state] = -0.5 * kappa_N_per_m * x_trigger_m**2 / kT_J
+    return reference_kT
+
+
+def plot_work_split_grid(events: dict, jump_by_state: dict, total_by_state: dict,
+                         kappa_N_per_m: float, T_K: float,
+                         predicted_work_kT: dict | None = None,
+                         trigger_reference_kT: dict | None = None) -> None:
+    """
+    Same grid/layout as plot_work_grid(), but from compute_work_split_kT()'s
+    output: the jump's own work is drawn as an explicit dashed step (0 at
+    t=0 up to <W_jump> at t_s[1], mirroring the notebook's own
+    _plot_lambda_jump convention for lambda itself) instead of being
+    invisibly folded into the first point of the cumulative curve, so the
+    jump's share of the total is visible at a glance. The solid red curve
+    is still the cumulative TOTAL (jump + smooth), identical to what
+    plot_work_grid(events, total_by_state, ...) would draw.
+
+    jump_by_state[state]  : (n_events,) - compute_work_split_kT()'s W_jump_kT.
+    total_by_state[state] : (n_events, protocol_frames) - its W_total_kT.
+
+    Two optional horizontal dashed reference lines, each dict[state] ->
+    float (kT units), drawn flat across the full time axis when given:
+    predicted_work_kT     : the analytical solver's own predicted mean
+                            work for this state (see
+                            analytical_protocols.load_predicted_work_J(),
+                            /kT_J to convert) - "what the optimal protocol
+                            was designed to extract".
+    trigger_reference_kT  : compute_trigger_energy_reference_kT()'s
+                            -0.5*kappa*<x_trigger>^2/kT - "what was
+                            naively available at the trigger instant".
+    """
+    states = list(events.keys())
+    n = len(states)
+    nrows, ncols = _grid_dims(n)
+    fig = plt.figure(figsize=(6.5 * ncols, 4.5 * nrows))
+
+    for i, state in enumerate(states):
+        ax = fig.add_subplot(nrows, ncols, i + 1)
+        _style_grid_axis(ax)
+        t_s = events[state]["t_s"]
+        W_kT = total_by_state[state]
+        n_events = W_kT.shape[0]
+        ax.set_title(f"$m_0={state[0]}$, $m_t={state[1]}$  n={n_events}")
+
+        if n_events == 0:
+            ax.text(0.5, 0.5, "no events", ha='center', va='center', transform=ax.transAxes)
+            continue
+
+        W_mean, W_std = W_kT.mean(axis=0), W_kT.std(axis=0)
+        W_jump_mean = jump_by_state[state].mean()
+
+        if len(t_s) > 1 and W_jump_mean != 0:
+            ax.plot([t_s[0], t_s[1]], [0.0, W_jump_mean], color="tab:orange",
+                   linestyle="--", lw=1.5)
+            ax.plot(t_s[0], 0.0, marker="o", ms=5, mfc="white", mec="tab:orange", zorder=5)
+
+        ax.plot(t_s, W_mean, color="tab:red", label="$\\langle W_{\\mathrm{total}} \\rangle$")
+        ax.fill_between(t_s, W_mean - W_std, W_mean + W_std, color="tab:red", alpha=0.2)
+
+        if predicted_work_kT is not None and state in predicted_work_kT:
+            ax.axhline(predicted_work_kT[state], color="tab:gray", linestyle="--", lw=1.2,
+                      label="predicted (analytical)")
+        if trigger_reference_kT is not None and state in trigger_reference_kT:
+            ax.axhline(trigger_reference_kT[state], color="tab:brown", linestyle=":", lw=1.2,
+                      label="$\\langle V_{ij}\\rangle^2$")
+
+        ax.set_ylabel("$W$ / kT")
+        ax.legend(fontsize=8)
+
+    fig.suptitle(f"Per-state work, jump vs. total  (kappa={kappa_N_per_m:.3e} N/m, T={T_K:.0f} K)")
     plt.tight_layout(rect=[0, 0, 1, 0.97])
     plt.show()
 

@@ -650,6 +650,12 @@ def compute_probability_of_outcome_analytical(m_0, m_t, params, time_between_mea
     float
         P(m_0, m_t), dimensionless, in [0, 1].
     """
+    if np.isclose(time_between_measurements, 0.0):
+        if m_0 != m_t:
+            return 0.0
+        low, up = set_bounds(params, m_0, n_outcomes)
+        norm, _, _ = _bin_normalization_and_moments_nondim(low, up, params)
+        return norm
     low_bound_0, up_bound_0 = set_bounds(params, m_0, n_outcomes)
     low_bound_t, up_bound_t = set_bounds(params, m_t, n_outcomes)
     norm_integral = dblquad(norm_intgrand, low_bound_0, up_bound_0,

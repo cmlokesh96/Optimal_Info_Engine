@@ -14,7 +14,7 @@ from sdesim.parameter_sweep import (
 )
 
 
-def run_and_report_detail(point, label, params, kT, reference_key="jump_second_only"):
+def run_and_report_detail(point, label, params, kT, reference_key="jump_both"):
     """
     Re-run the full pipeline for one flagged parameter point and print,
     for each individual (m_0, m_t) outcome, the work quantities and the
@@ -73,15 +73,15 @@ def main():
     # swept axis and anoptimal parameter for the spacing of the tested values, default 10% of the domain
     # e.g. 11 swept values (initial values and then ten steps to the end)
     # start==end leads to fix the Axis at this value and not sweep it
-    kappa_axis = SweepAxis.from_values([2e-6, 5e-6, 2e-5, 5e-5])
+    kappa_axis = SweepAxis.from_values([2.4e-6, 5e-6])
 
     x_thresh_sigma_multiple_axis = SweepAxis.from_values(
-        np.linspace(0.2, 1.6, round((1.6 - 0.2) / 0.1) + 1)  # 0.2, 0.3, ..., 1.6
+        np.linspace(0.2, 1, 1.6, round((1.6 - 0.2) / 0.1) + 1)  # 0.2, 0.3, ..., 1.6
     )
 
-    t_second_measurement_axis = SweepAxis.from_values([0.2, 0.5, 1, 5,10])  
+    t_second_measurement_axis = SweepAxis.from_values([0.2, 0.5, 1])  
 
-    t_protocol_end_axis = SweepAxis.from_values([1, 3, 5])  
+    t_protocol_end_axis = SweepAxis.from_values([ 3])  
 
     print("Running sweep...")
     sweep_results = run_parameter_sweep(

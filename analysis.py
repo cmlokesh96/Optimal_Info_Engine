@@ -55,28 +55,48 @@ def compute_potential(x_nm: np.ndarray, n_bins: int = 60, T_K: float = 298.0) ->
     if len(x) < 10:
         raise ValueError("compute_potential: not enough valid (non-NaN) samples")
 
-    counts, edges = np.histogram(x, bins=n_bins)
-    centers = 0.5 * (edges[:-1] + edges[1:])
-    bin_width = edges[1] - edges[0]
+    # Symmetric binning: pick a bin width from the data range/n_bins as
+    # before, but then lay bin CENTERS at 0, +/-bin_width, +/-2*bin_width,
+    # ... (so edges fall at +/-0.5*bin_width, +/-1.5*bin_width, ...) rather
+    # than np.histogram's default of splitting [min, max] into n_bins
+    # bins with no guarantee any edge/center lands on 0.
+    bin_width = (x.max() - x.min()) / n_bins
+    n_side = int(np.ceil(max(abs(x.min()), abs(x.max())) / bin_width))
+    centers_all = np.arange(-n_side, n_side + 1) * bin_width
+    edges = (np.arange(-n_side, n_side + 2) - 0.5) * bin_width
+
+    counts, edges = np.histogram(x, bins=edges)
+    centers = centers_all
 
     valid = counts > 0
     x_valid = centers[valid]
     P = counts[valid] / (counts.sum() * bin_width)
     U_raw = -np.log(P)
 
+    # Fit only the well-sampled bins near the well bottom — tails out past
+    # U/kT = 6 are sparse-count bins where -log(P) noise blows up, and a
+    # true anharmonic trap deviates from parabolic out there anyway, so
+    # including them would bias the quadratic fit away from the harmonic
+    # region it's supposed to describe.
+    fit_mask = (U_raw - U_raw.min()) < 5.0
+
     # Fit on the raw (unshifted) values — an additive constant doesn't
     # affect the quadratic/linear coefficients (stiffness, x0).
-    a, b, c = np.polyfit(x_valid, U_raw, 2)
+    a, b, c = np.polyfit(x_valid[fit_mask], U_raw[fit_mask], 2)
     x0_fit_nm = -b / (2 * a)
     fit_offset = a * x0_fit_nm**2 + b * x0_fit_nm + c   # fit's value at its own vertex
 
     U_over_kT = U_raw - fit_offset   # shift so the fit's minimum sits at 0
     k_fit_over_kT = 2 * a            # 1/nm^2
-    k_eq_over_kT = 1.0 / np.var(x, ddof=1)   # 1/nm^2
+    x_mean_nm = float(np.mean(x))
+    k_eq_over_kT = 1.0 / np.var(x, ddof=1)   # 1/nm^2 — equipartition is about the mean, not x0_fit
 
     return {
         "bin_centers_nm": x_valid,
         "U_over_kT": U_over_kT,
+        "P_density": P,
+        "fit_mask": fit_mask,
+        "x_mean_nm": x_mean_nm,
         "fit_coeffs": (a, b, c),
         "fit_offset": fit_offset,
         "x0_fit_nm": x0_fit_nm,
@@ -90,27 +110,46 @@ def compute_potential(x_nm: np.ndarray, n_bins: int = 60, T_K: float = 298.0) ->
 
 
 def plot_potential(result: dict) -> None:
-    """Plot U(x)/kT vs x with the parabolic fit overlaid, per compute_potential()."""
+    """
+    Plot the equilibrium distribution P(x) alongside U(x)/kT (with the
+    parabolic fit overlaid), per compute_potential(). Points excluded from
+    the fit (U/kT >= 5 from the well bottom) are shown hollow/gray in the
+    U(x)/kT panel so it's clear how much of the tail the fit ignored.
+    """
     x = result["bin_centers_nm"]
     U = result["U_over_kT"]
+    P = result["P_density"]
+    fit_mask = result["fit_mask"]
     a, b, c = result["fit_coeffs"]
     offset = result["fit_offset"]
 
-    x_fit = np.linspace(x.min(), x.max(), 200)
+    x_fit = np.linspace(x[fit_mask].min(), x[fit_mask].max(), 200)
     U_fit = a * x_fit**2 + b * x_fit + c - offset
+    U_eq_fit = 0.5 * result["k_eq_over_kT"] * (x_fit - result["x_mean_nm"])**2
 
-    plt.figure(figsize=(7, 5))
-    plt.plot(x, U, "o", ms=4, color="steelblue", label="U/kT = -ln P(x)")
-    plt.plot(x_fit, U_fit, "-", color="tomato",
-             label=f"parabolic fit (k = {result['k_fit_N_per_m']:.3e} N/m)")
-    plt.axvline(result["x0_fit_nm"], color="gray", lw=0.8, ls="--")
-    plt.xlabel("x (nm)")
-    plt.ylabel("U(x) / kT")
-    plt.title(f"Trap potential  (n={result['n_samples']}, T={result['T_K']:.0f} K)\n"
-              f"k_fit = {result['k_fit_N_per_m']:.3e} N/m   "
-              f"k_eq = {result['k_eq_N_per_m']:.3e} N/m")
-    plt.legend()
-    plt.grid(True, alpha=0.3)
+    fig, (ax_p, ax_u) = plt.subplots(1, 2, figsize=(13, 5))
+
+    ax_p.plot(x, P, "o-", ms=4, color="seagreen")
+    ax_p.set_xlabel("x (nm)")
+    ax_p.set_ylabel("P(x)  (equilibrium distribution)")
+    ax_p.set_title(f"Equilibrium distribution (n={result['n_samples']})")
+    ax_p.grid(True, alpha=0.3)
+
+    ax_u.plot(x[fit_mask], U[fit_mask], "o", ms=4, color="steelblue",
+              label="U/kT = -ln P(x)  (< 5)")
+    ax_u.plot(x_fit, U_fit, "-", color="tomato",
+              label=f"parabolic fit (k_fit = {result['k_fit_N_per_m']:.3e} N/m)")
+    ax_u.plot(x_fit, U_eq_fit, "--", color="blue",
+              label=f"equipartition (k_eq = {result['k_eq_N_per_m']:.3e} N/m)")
+    ax_u.axvline(result["x0_fit_nm"], color="gray", lw=0.8, ls="--")
+    ax_u.set_xlabel("x (nm)")
+    ax_u.set_ylabel("U(x) / kT")
+    ax_u.set_title(f"Trap potential  (T={result['T_K']:.0f} K)\n"
+                   f"k_fit = {result['k_fit_N_per_m']:.3e} N/m   "
+                   f"k_eq = {result['k_eq_N_per_m']:.3e} N/m")
+    ax_u.legend()
+    ax_u.grid(True, alpha=0.3)
+
     plt.tight_layout()
     plt.show()
 
@@ -919,6 +958,110 @@ def compute_trigger_energy_reference_kT(events: dict, kappa_N_per_m: float, T_K:
     return reference_kT
 
 
+def compute_experimental_probabilities(events: dict, fire_00_prob: float | None = None) -> dict:
+    """
+    Empirical P(m_0, m_t) per state - each state's real fired-event count
+    (events[state]["x_nm"].shape[0]) divided by the total across every
+    state in events - straight from the batch data, no solver dependency
+    at all. Compare against the analytical solver's own predicted
+    probabilities (analytical_protocols.load_predicted_probabilities()) to
+    see whether the real decode/fire rates matched what was expected.
+
+    (0,0) needs special handling: it's gated by fire_00_prob (an unbiased
+    Bernoulli draw made independently every time (0,0) is decoded - see
+    SessionParams2Ch.fire_00_prob's docstring and run_session_2ch's
+    should_fire_00), so only a fire_00_prob fraction of real (0,0) decodes
+    ever produce a countable fired event (extract_protocol_events() only
+    extracts ZERO_FIRE_CODE frames, not every ordinary
+    STATE_TO_CODE[(0,0)] decode). Every other state fires on every single
+    decode (should_fire_real has no such gating), so its fired-event count
+    already equals its true decode count. Left uncorrected, (0,0)'s raw
+    count massively understates its true decode probability (in practice
+    often the single most common decode outcome) and inflates every other
+    state's apparent share.
+
+    Pass fire_00_prob (the session's actual SessionParams2Ch.fire_00_prob,
+    e.g. section 4's FIRE_00_PROB) to correct for this: (0,0)'s raw fired
+    count is divided by fire_00_prob first (estimating its true decode
+    count) before normalizing across all states. None (default) skips the
+    correction - only appropriate if fire_00_prob was actually 1.0, or if
+    events doesn't include (0,0) at all.
+
+    Returns
+    -------
+    dict[state] -> float, summing to 1.0 across events (0.0 for every
+    state if events itself has zero total events).
+    """
+    counts = {state: float(data["x_nm"].shape[0]) for state, data in events.items()}
+    if fire_00_prob is not None and fire_00_prob > 0 and (0, 0) in counts:
+        counts[(0, 0)] = counts[(0, 0)] / fire_00_prob
+    total = sum(counts.values())
+    if total == 0:
+        return {state: 0.0 for state in counts}
+    return {state: n / total for state, n in counts.items()}
+
+
+def compute_weighted_average_kT(values_by_state: dict, weights_by_state: dict) -> float:
+    """
+    Generic probability-weighted average of any per-state scalar (kT
+    units): sum_i(weight_i * value_i) / sum_i(weight_i). The shared
+    primitive behind compute_weighted_mean_work_kT() (values = each
+    state's final mean work) - also usable directly for e.g. the average
+    trigger-energy reference:
+        compute_weighted_average_kT(trigger_reference_kT,
+                                    compute_experimental_probabilities(batch_events, fire_00_prob))
+    ("the average V_ij using experimental probabilities").
+
+    values_by_state, weights_by_state: dict[state] -> float. A state
+    present in weights_by_state but missing from values_by_state is
+    skipped, not zero-valued - it simply doesn't contribute to either sum.
+
+    Returns
+    -------
+    float, kT units - nan if no state had both a weight and a value.
+    """
+    numerator, denominator = 0.0, 0.0
+    for state, weight in weights_by_state.items():
+        if state not in values_by_state:
+            continue
+        numerator += weight * values_by_state[state]
+        denominator += weight
+    return numerator / denominator if denominator else float("nan")
+
+
+def compute_weighted_mean_work_kT(total_by_state: dict, weights_by_state: dict) -> float:
+    """
+    Probability-weighted mean final work across states:
+        sum_i(weight_i * mean(W_total_kT_i[:, -1])) / sum_i(weight_i)
+    - the same aggregate run_single_parameter_point_cli.py's own
+    "weighted_mean_work" printout computes, but generalized to any weight
+    source, e.g.:
+        compute_weighted_mean_work_kT(batch_W_total_kT,
+                                      compute_experimental_probabilities(batch_events))
+        compute_weighted_mean_work_kT(batch_W_total_kT,
+                                      analytical_protocols.load_predicted_probabilities(ANALYTICAL_SAVE_DIR))
+
+    total_by_state  : dict[state] -> (n_events, protocol_frames) ndarray,
+                     e.g. compute_work_split_kT()'s W_total_kT per state -
+                     only the final sample ([:, -1]) is used.
+    weights_by_state: dict[state] -> float - need not sum to 1 (normalized
+                     internally via the denominator). A state present in
+                     weights_by_state but missing from total_by_state (or
+                     with zero events there) is skipped, not zero-weighted -
+                     it simply doesn't contribute to either sum.
+
+    Returns
+    -------
+    float, kT units - nan if no state had both a weight and real events.
+    """
+    final_work_by_state = {
+        state: data[:, -1].mean()
+        for state, data in total_by_state.items()
+        if data.shape[0] > 0
+    }
+    return compute_weighted_average_kT(final_work_by_state, weights_by_state)
+
+
 def plot_work_split_grid(events: dict, jump_by_state: dict, total_by_state: dict,
                          kappa_N_per_m: float, T_K: float,
                          predicted_work_kT: dict | None = None,
@@ -973,14 +1116,14 @@ def plot_work_split_grid(events: dict, jump_by_state: dict, total_by_state: dict
             ax.plot(t_s[0], 0.0, marker="o", ms=5, mfc="white", mec="tab:orange", zorder=5)
 
         ax.plot(t_s, W_mean, color="tab:red", label="$\\langle W_{\\mathrm{total}} \\rangle$")
-        ax.fill_between(t_s, W_mean - W_std, W_mean + W_std, color="tab:red", alpha=0.2)
+        #ax.fill_between(t_s, W_mean - W_std, W_mean + W_std, color="tab:red", alpha=0.2)
 
         if predicted_work_kT is not None and state in predicted_work_kT:
-            ax.axhline(predicted_work_kT[state], color="tab:gray", linestyle="--", lw=1.2,
+            ax.axhline(predicted_work_kT[state], color="tab:gray", linestyle="--", lw=2,
                       label="predicted (analytical)")
         if trigger_reference_kT is not None and state in trigger_reference_kT:
-            ax.axhline(trigger_reference_kT[state], color="tab:brown", linestyle=":", lw=1.2,
-                      label="$\\langle V_{ij}\\rangle^2$")
+            ax.axhline(trigger_reference_kT[state], color="tab:brown", linestyle=":", lw=2,
+                      label="$\\langle V_{ij}\\rangle$")
 
         ax.set_ylabel("$W$ / kT")
         ax.legend(fontsize=8)

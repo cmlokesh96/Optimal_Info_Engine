@@ -122,6 +122,22 @@ def main():
         weighted_numerator_sum += probability * optimal
         weighted_denominator_sum += probability * reference_value
 
+    # detailed_results' "probability" isn't saved anywhere by
+    # run_single_parameter_point()/process_combination.py's own np.savez()
+    # call (checked: only mean_work/trajectory data land in the .npz) - so
+    # it's saved here instead, alongside the .npz files, for a later
+    # probability-weighted work aggregate (e.g.
+    # analysis.compute_weighted_mean_work_kT()) without needing this venv
+    # again. Keys match detailed_results' own "m_0={..},m_t={..}" format -
+    # see analytical_protocols.load_predicted_probabilities() for the
+    # matching loader (parses back to (int, int) state tuples).
+    import json
+    probabilities = {key: summary["probability"] for key, summary in detailed_results.items()}
+    prob_path = os.path.join(args.save_dir, "predicted_probabilities.json")
+    with open(prob_path, "w") as f:
+        json.dump(probabilities, f, indent=2)
+    print(f"\nSaved predicted probabilities: {prob_path}")
+
     print("\nProbability-weighted aggregates over outcomes:")
     if prob_sum > 0:
         print(f"  weighted_mean_work     = {weighted_work_sum/prob_sum/kT:.4g} kBT")

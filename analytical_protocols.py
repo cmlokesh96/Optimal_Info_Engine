@@ -190,3 +190,37 @@ def load_predicted_work_J(save_dir, t_second_measurement, t_protocol_end, real_s
               f"these states will be absent from the returned dict.")
 
     return predicted_work_J
+
+
+def load_predicted_probabilities(save_dir):
+    """
+    The analytical solver's own predicted P(m_0, m_t) per state, from
+    save_dir/predicted_probabilities.json - written by
+    run_single_parameter_point_cli.py (not by process_combination.py's own
+    np.savez() call, which never saves "probability" at all - checked).
+    Only exists if that CLI script has actually been run with
+    --save_dir=save_dir; raises FileNotFoundError otherwise.
+
+    Returns
+    -------
+    dict[(int, int), float] - predicted probability per state, keys parsed
+    back from the JSON's "m_0={..},m_t={..}" string format.
+    """
+    import json
+    path = os.path.join(save_dir, "predicted_probabilities.json")
+    if not os.path.exists(path):
+        raise FileNotFoundError(
+            f"{path} not found - run "
+            f"run_single_parameter_point_cli.py with --save_dir={save_dir!r} "
+            f"first (it writes this file alongside the .npz protocols)."
+        )
+    with open(path) as f:
+        raw = json.load(f)
+
+    probabilities = {}
+    for key, probability in raw.items():
+        m_0_str, m_t_str = key.split(",")
+        m_0 = int(round(float(m_0_str.split("=")[1])))
+        m_t = int(round(float(m_t_str.split("=")[1])))
+        probabilities[(m_0, m_t)] = probability
+    return probabilities

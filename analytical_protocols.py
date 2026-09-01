@@ -192,6 +192,64 @@ def load_predicted_work_J(save_dir, t_second_measurement, t_protocol_end, real_s
     return predicted_work_J
 
 
+def load_predicted_mean_x_trigger_nm(save_dir, t_second_measurement, t_protocol_end, real_states=None):
+    """
+    The analytical solver's own assumed mean trap-relative TRIGGER
+    position per (m_0, m_t) state - optimal_trajectories' X(t) at t=0
+    (traj[1, 0]), i.e. the conditional mean position the optimal
+    protocol's initial jump is designed around.
+
+    Directly comparable to two other estimates of the same physical
+    quantity, with no shared assumptions between any pair of the three:
+    a real batch's own events[state]["x_nm"][:, 0].mean() (see
+    analysis.py::compute_trigger_energy_reference_kT's docstring - the
+    raw camera reading at the fire's decide/trigger frame, X_true(0-)
+    since lambda(0-)=0 at that instant), and
+    analysis.py::compute_equilibrium_state_stats()'s mean_x_trigger_nm
+    (the same quantity estimated straight from an undisturbed equilibrium
+    trace, no hardware firing or solver involved at all).
+
+    Same file-glob/state-resolution convention as load_predicted_work_J()
+    (same save_dir/t_second_measurement/t_protocol_end must be used for
+    every one of load_analytical_protocols()/load_predicted_work_J()/this
+    function, or the comparison isn't apples-to-apples). (0, 0) is always
+    0.0 (no protocol fires there, its trap-relative position is unused).
+
+    Returns
+    -------
+    dict[(int, int), float] - predicted mean trigger position, nm. A
+    state with no saved file is simply absent (matches
+    load_analytical_protocols()'s "negligible probability" case).
+    """
+    pattern = os.path.join(
+        save_dir,
+        f"t2_{_fmt(t_second_measurement)}_tf_{_fmt(t_protocol_end)}_m0_*_mt_*.npz",
+    )
+    paths = sorted(glob.glob(pattern))
+    if not paths:
+        raise FileNotFoundError(
+            f"No analytical protocol files matched {pattern!r} — check "
+            f"t_second_measurement/t_protocol_end match what "
+            f"run_single_parameter_point.py was actually run with."
+        )
+
+    mean_x_trigger_nm = {(0, 0): 0.0}
+    for path in paths:
+        with np.load(path) as data:
+            m_0 = int(round(float(data["m_0"])))
+            m_t = int(round(float(data["m_t"])))
+            if (m_0, m_t) == (0, 0):
+                continue  # keep the exact-zero above, not this file's numerical noise
+            mean_x_trigger_nm[(m_0, m_t)] = float(data["optimal_trajectories"][1, 0]) * POSITION_SCALE_M_TO_NM
+
+    missing = [s for s in (real_states if real_states is not None else REAL_STATES) if s not in mean_x_trigger_nm]
+    if missing:
+        print(f"load_predicted_mean_x_trigger_nm: no saved file for {missing} - "
+              f"these states will be absent from the returned dict.")
+
+    return mean_x_trigger_nm
+
+
 def load_predicted_probabilities(save_dir):
     """
     The analytical solver's own predicted P(m_0, m_t) per state, from

@@ -154,6 +154,84 @@ def plot_potential(result: dict) -> None:
     plt.show()
 
 
+def compute_equilibrium_state_stats(x_nm: np.ndarray, fps: float, xth_nm: float,
+                                    delta_t_s: float) -> dict:
+    """
+    Model-free empirical P(m_0, m_t) and mean trigger position per state,
+    straight from an equilibrium (undisturbed) x(t) trace - decodes every
+    (x[i], x[i+offset]) pair the same way run_session_2ch's real decide
+    checkpoint does (protocols_2ch.decode_symbol/STATE_TO_CODE), where
+    offset is delta_t_s converted to frames at fps.
+
+    The TRIGGER position is x[i+offset] (the CURRENT, second-measurement
+    sample), not x[i] - this is the same physical instant
+    compute_trigger_energy_reference_kT's x_trigger is (events[state]
+    ["x_nm"][:, 0], the raw camera reading at the fire's own decide
+    checkpoint frame): experiment.py's decide checkpoint reads x_curr at
+    that same frame and immediately fires from it (x_prev, from
+    delta_t_s earlier, only contributes to the DECODE, not to where the
+    protocol actually launches from).
+
+    Directly comparable to two other estimates of the same per-state
+    quantities: analytical_protocols.load_predicted_probabilities()/
+    load_predicted_mean_x_trigger_nm() (the solver's own assumptions) and
+    a real batch's own compute_experimental_probabilities()/
+    compute_trigger_energy_reference_kT()-adjacent x_nm[:, 0].mean() (what
+    actually got measured while firing protocols) - a 3-way check with no
+    shared assumptions between any two of the three.
+
+    Parameters
+    ----------
+    x_nm      : 1D equilibrium trace, nm (e.g. combined_calib_px[:, 0] *
+        NM_PER_PX - x_center_nm). If this pools multiple separate
+        calibration runs concatenated end-to-end (load_combined_calib_pos_px),
+        the handful of pairs straddling a run boundary are decoded across
+        two unrelated runs - negligible given offset << a single run's
+        length, not worth splitting out.
+    fps       : camera frame rate x_nm was recorded at.
+    xth_nm    : decode threshold - must match whatever xth_nm the real
+        session(s) being compared against actually used.
+    delta_t_s : spacing between the two decision samples - must match
+        ANALYTICAL_T2/DELTA_T_S (0 for a single-measurement comparison,
+        where x_prev and x_curr collapse to the same instant, mirroring
+        experiment.py's single_measurement convention).
+
+    Returns
+    -------
+    dict[state] -> {"prob": float, "mean_x_trigger_nm": float, "n": int}
+        prob sums to 1 across the 9 states (0.0/nan/0 for a state with no
+        occurrences in this trace).
+    """
+    from protocols_2ch import decode_symbol, STATE_TO_CODE
+
+    x = np.asarray(x_nm, dtype=float)
+    offset = max(1, round(delta_t_s * fps)) if delta_t_s > 0 else 0
+
+    if offset == 0:
+        x_prev_all, x_curr_all = x, x
+    else:
+        x_prev_all, x_curr_all = x[:-offset], x[offset:]
+
+    valid = np.isfinite(x_prev_all) & np.isfinite(x_curr_all)
+    x_prev_all, x_curr_all = x_prev_all[valid], x_curr_all[valid]
+
+    decode = np.vectorize(decode_symbol, otypes=[int])
+    m_0_all = decode(x_prev_all, xth_nm)
+    m_t_all = decode(x_curr_all, xth_nm)
+
+    total = len(x_prev_all)
+    out = {}
+    for state in STATE_TO_CODE:
+        mask = (m_0_all == state[0]) & (m_t_all == state[1])
+        n = int(mask.sum())
+        out[state] = {
+            "prob": (n / total) if total else 0.0,
+            "mean_x_trigger_nm": float(x_curr_all[mask].mean()) if n else float("nan"),
+            "n": n,
+        }
+    return out
+
+
 # ══════════════════════════════════════════════════════════════════════════
 # Per-state protocol-event extraction, cumulative work, plotting, MATLAB export
 #

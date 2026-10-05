@@ -20,7 +20,7 @@ Mirrors MATLAB usage exactly:
 
     cam.close()                   # call when completely done
 """
-
+NM_PER_PX = 16   # update after calibration
 import threading
 import numpy as np
 import cv2
@@ -28,7 +28,7 @@ from pypylon import pylon, genicam
 from scipy.ndimage import gaussian_filter
 
 
-NM_PER_PX = 16   # update after calibration
+
 
 # ---------------------------------------------------------------------------
 # Parameters, same names as in Track.m
@@ -134,6 +134,100 @@ def find_particle_fast(im, prev=None, roi=96, thres=THRES, matlab_indexing=True)
     x, y = xf + ox, yf + oy
     return (x + 1.0, y + 1.0) if matlab_indexing else (x, y)
 
+# ── Gradient / radial-symmetry particle center ─────────────────────────────
+# Python port of Track_RP_NatMeth_2.m's per-frame algorithm (gradient
+# intersection / radial-symmetry center, Parthasarathy Nat. Methods 2012).
+# Every pixel's local intensity gradient defines a line through that pixel,
+# perpendicular to the gradient; for a symmetric spot all these lines pass
+# through the same point, so the center is the gradient-magnitude-weighted
+# least-squares intersection of all of them.
+
+_H3 = np.ones((3, 3), dtype=np.float32) / 9.0   # h = ones(3)/9 in the .m script
+_INFSLOPE = 9e9                                  # infslope in the .m script
+
+
+def _gauss1d(sigma):
+    """1-D Gaussian kernel, same construction as the .m script's `gk`."""
+    if sigma <= 0:
+        return None
+    r = np.arange(-int(np.ceil(3 * sigma)), int(np.ceil(3 * sigma)) + 1, dtype=np.float32)
+    g = np.exp(-r ** 2 / (2 * sigma ** 2))
+    return (g / g.sum()).astype(np.float32)
+
+
+def find_particle_gradient(im, smooth_sigma=3, matlab_indexing=True):
+    """Drop-in alternative to find_particle_fast, same (x, y) return
+    convention. Runs on the WHOLE frame every call — no windowed search,
+    no threshold — since it's a fixed amount of work (a few image-sized
+    convolutions and sums) regardless of where the particle sits, which is
+    cheap enough at this project's ROI sizes (see BaslerCamera.roi()).
+
+    Returns (nan, nan) if the frame has no gradient at all (flat image) or
+    the weighted least-squares system is singular.
+    """
+    if im is None or im.ndim != 2 or im.size < 4:
+        return np.nan, np.nan
+    I = im.astype(np.float32, copy=False)
+    Ny, Nx = I.shape
+
+    gk = _gauss1d(smooth_sigma)
+    if gk is not None:
+        I = cv2.sepFilter2D(I, cv2.CV_32F, gk, gk, borderType=cv2.BORDER_CONSTANT)
+
+    # Diagonal derivatives between the 2x2 blocks of pixels
+    dIdu = I[0:Ny - 1, 1:Nx] - I[1:Ny, 0:Nx - 1]
+    dIdv = I[0:Ny - 1, 0:Nx - 1] - I[1:Ny, 1:Nx]
+
+    fdu = cv2.filter2D(dIdu, cv2.CV_32F, _H3, borderType=cv2.BORDER_CONSTANT)
+    fdv = cv2.filter2D(dIdv, cv2.CV_32F, _H3, borderType=cv2.BORDER_CONSTANT)
+
+    dImag2 = fdu * fdu + fdv * fdv
+
+    with np.errstate(divide='ignore', invalid='ignore'):
+        m = -(fdv + fdu) / (fdu - fdv)
+    nanmask = np.isnan(m)              # true 0/0 (no gradient at all here)
+    m[np.isinf(m)] = _INFSLOPE          # vertical lines (fdu == fdv != 0)
+
+    xm_row = np.arange(Nx - 1, dtype=np.float32) - (Nx - 2) / 2.0
+    ym_col = np.arange(Ny - 1, dtype=np.float32) - (Ny - 2) / 2.0
+    xm = np.broadcast_to(xm_row, (Ny - 1, Nx - 1))
+    ym = np.broadcast_to(ym_col[:, None], (Ny - 1, Nx - 1))
+
+    b = ym - m * xm
+
+    sdI2 = float(dImag2.sum())
+    if sdI2 == 0:
+        return np.nan, np.nan
+    xcentroid = float((dImag2 * xm).sum()) / sdI2
+    ycentroid = float((dImag2 * ym).sum()) / sdI2
+
+    with np.errstate(divide='ignore', invalid='ignore'):
+        w = dImag2 / np.sqrt((xm - xcentroid) ** 2 + (ym - ycentroid) ** 2)
+
+    w[nanmask] = 0.0
+    b[nanmask] = 0.0
+    m[nanmask] = 0.0
+
+    # Weighted least-squares intersection of all the gradient lines
+    wm2p1 = w / (m * m + 1.0)
+    sw   = float(wm2p1.sum())
+    smmw = float((m * m * wm2p1).sum())
+    smw  = float((m * wm2p1).sum())
+    smbw = float((m * b * wm2p1).sum())
+    sbw  = float((b * wm2p1).sum())
+
+    det = smw * smw - smmw * sw
+    if det == 0 or not np.isfinite(det):
+        return np.nan, np.nan
+
+    xc = (smbw * sw - smw * sbw) / det
+    yc = (smbw * smw - smmw * sbw) / det
+
+    if matlab_indexing:
+        return xc + (Nx + 1) / 2.0, yc + (Ny + 1) / 2.0
+    return xc + (Nx - 1) / 2.0, yc + (Ny - 1) / 2.0
+
+
 # def _find_particle(im, sigma=2.0, crop_r = 15):
 #     if im is None or im.ndim != 2 or im.size == 0:
 #         return np.nan, np.nan
@@ -180,6 +274,8 @@ class BaslerCamera:
         self._preview_stop   = threading.Event()
         self._preview_fps    = 30.0
         self._preview_track_particle = False
+        self._preview_method = "fast"
+        self._preview_smooth_sigma = 3
 
         # find()'s windowed search state (find_particle_fast's `prev`) — lets
         # consecutive find() calls only blur a small region around the last
@@ -349,7 +445,8 @@ class BaslerCamera:
 
     # ── Preview — mirrors MATLAB startview/stopview ───────────────────────────
 
-    def startview(self, particle_cross: bool = False):
+    def startview(self, particle_cross: bool = False, method: str = "fast",
+                  smooth_sigma: float = 3):
         """
         Open live preview window in background thread. Returns immediately.
         Mirrors MATLAB obj.startview() / preview(obj.vid)
@@ -357,11 +454,21 @@ class BaslerCamera:
 
         Args:
             particle_cross: Draw a cross marker at detected particle location.
+            method: tracking method for the cross marker — "fast" (default)
+                or "gradient", same choices as BaslerCamera.find(). Lets you
+                eyeball the two methods against each other before picking
+                one for a real session.
+            smooth_sigma: only used when method="gradient" — same meaning,
+                and same default (3), as find()/find_particle_gradient(), so
+                what you see here matches what a real session using
+                find_method="gradient" will actually track.
         """
         if self._preview_thread and self._preview_thread.is_alive():
             print("[Camera] Preview already running")
             return
         self._preview_track_particle = bool(particle_cross)
+        self._preview_method = method
+        self._preview_smooth_sigma = smooth_sigma
         self._preview_stop.clear()
         self._preview_thread = threading.Thread(
             target=self._preview_loop, daemon=True
@@ -401,7 +508,12 @@ class BaslerCamera:
                     # Independent of find()'s own tracking state — preview is
                     # just a visual check, not the real measurement path — so
                     # this always does a fresh whole-frame search (prev=None).
-                    x_px, y_px = find_particle_fast(frame, prev=None, matlab_indexing=False)
+                    if self._preview_method == "gradient":
+                        x_px, y_px = find_particle_gradient(
+                            frame, smooth_sigma=self._preview_smooth_sigma, matlab_indexing=False,
+                        )
+                    else:
+                        x_px, y_px = find_particle_fast(frame, prev=None, matlab_indexing=False)
                     if not np.isnan(x_px):
                         px = int(round(x_px))
                         py = int(round(y_px))
@@ -469,7 +581,8 @@ class BaslerCamera:
         return frame
 
     def find(self, frame: np.ndarray, nm_per_px: float = NM_PER_PX,
-            roi: int = 96, thres: float = THRES):
+            roi: int = 96, thres: float = THRES,
+            method: str = "fast", smooth_sigma: float = 3):
         """
         Raw sub-pixel particle position, scaled to nm via nm_per_px — NOT
         centered on anything (not the ROI, not the trap). Pixel (0,0) is
@@ -482,20 +595,39 @@ class BaslerCamera:
         run_session_2ch(), which do exactly that for every other
         calculation (decode, potential analysis, ...) downstream of this.
 
-        roi/thres are find_particle_fast()'s windowed-search size and
-        detection threshold — exposed here so they're tunable per-call
-        without editing this file. If the particle's frame-to-frame motion
-        often exceeds roi/2, detections land near the window edge and
-        find_particle_fast falls back to a full-frame search for that
-        frame (much slower) — widening roi avoids that at some extra
-        per-frame cost from the larger window itself.
+        method="fast" (default): find_particle_fast() — windowed
+        argmax + Gaussian-blur + parabola fit. roi/thres are its
+        windowed-search size and detection threshold — exposed here so
+        they're tunable per-call without editing this file. If the
+        particle's frame-to-frame motion often exceeds roi/2, detections
+        land near the window edge and find_particle_fast falls back to a
+        full-frame search for that frame (much slower) — widening roi
+        avoids that at some extra per-frame cost from the larger window
+        itself.
+
+        method="gradient": find_particle_gradient() — full-frame
+        intensity-gradient intersection (Track_RP_NatMeth_2.m /
+        Parthasarathy Nat. Methods 2012). No windowing or threshold (roi,
+        thres are ignored); smooth_sigma pre-blurs the frame before taking
+        gradients (default 3 px; pass 0 to disable, matching the .m
+        script's own default). Costs the same amount of work every call
+        regardless of where the particle is — fine at this project's ROI
+        sizes — and tends to be more accurate for a symmetric spot since
+        every pixel contributes.
 
         Returns (x_nm, y_nm).
         """
-        x_px, y_px = find_particle_fast(
-            frame, prev=self._prev_particle_px, roi=roi, thres=thres,
-            matlab_indexing=False,
-        )
+        if method == "gradient":
+            x_px, y_px = find_particle_gradient(
+                frame, smooth_sigma=smooth_sigma, matlab_indexing=False,
+            )
+        elif method == "fast":
+            x_px, y_px = find_particle_fast(
+                frame, prev=self._prev_particle_px, roi=roi, thres=thres,
+                matlab_indexing=False,
+            )
+        else:
+            raise ValueError(f"find(): unknown method {method!r} (expected 'fast' or 'gradient')")
         self._prev_particle_px = (x_px, y_px)
         if np.isnan(x_px):
             return np.nan, np.nan

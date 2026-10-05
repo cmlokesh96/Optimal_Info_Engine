@@ -14,7 +14,7 @@ from sdesim.parameter_sweep import (
 )
 
 
-def run_and_report_detail(point, label, params, kT, reference_key="jump_second_only"):
+def run_and_report_detail(point, label, params, kT, reference_key="jump_both"):
     """
     Re-run the full pipeline for one flagged parameter point and print,
     for each individual (m_0, m_t) outcome, the work quantities and the
@@ -31,6 +31,7 @@ def run_and_report_detail(point, label, params, kT, reference_key="jump_second_o
     print(f"\nDetailed work summary for {label} (per outcome):")
     weighted_work_sum, prob_sum = 0.0, 0.0
     weighted_numerator_sum, weighted_denominator_sum = 0.0, 0.0
+    weighted_jump_both_sum, weighted_jump_second_only_sum = 0.0, 0.0
 
     for key, summary in detailed_results.items():
         probability = summary["probability"]
@@ -58,11 +59,16 @@ def run_and_report_detail(point, label, params, kT, reference_key="jump_second_o
         prob_sum += probability
         weighted_numerator_sum += probability * optimal
         weighted_denominator_sum += probability * reference_value
+        weighted_jump_both_sum += probability * jump_both
+        weighted_jump_second_only_sum += probability * jump_second_only
 
     print(f"\nSanity check: recomputed weighted aggregates for {label}:")
     if prob_sum > 0:
         print(f"  weighted_mean_work        = {weighted_work_sum/prob_sum/kT:.4g} kBT")
     print(f"  weighted_ratio_of_means    = {weighted_numerator_sum/weighted_denominator_sum:.4g}")
+    print(f"  weighted_difference_of_means    = {-(weighted_numerator_sum - weighted_denominator_sum)/kT:.4g} kBT")
+    print(f"  weighted_jump_both_sum          = {weighted_jump_both_sum/prob_sum/kT:.4g} kBT")
+    print(f"  weighted_jump_second_only_sum   = {weighted_jump_second_only_sum/prob_sum/kT:.4g} kBT")
 
 
 def main():
@@ -73,15 +79,15 @@ def main():
     # swept axis and anoptimal parameter for the spacing of the tested values, default 10% of the domain
     # e.g. 11 swept values (initial values and then ten steps to the end)
     # start==end leads to fix the Axis at this value and not sweep it
-    kappa_axis = SweepAxis.from_values(np.linspace(0.5e-6, 5e-6, 20))
+    kappa_axis = SweepAxis.from_values(np.linspace(2e-6, 5e-6, 10))
 
     x_thresh_sigma_multiple_axis = SweepAxis.from_values(
-        np.linspace(0.1, 2, 20)  # 0.2, 0.3, ..., 1.6
+        np.linspace(0.1, 2, 10)  # 0.2, 0.3, ..., 1.6
     )
 
     t_second_measurement_axis = SweepAxis.from_values([0.5])
 
-    t_protocol_end_axis = SweepAxis.from_values([10])
+    t_protocol_end_axis = SweepAxis.from_values([3])
 
     print("Running sweep...")
     sweep_results = run_parameter_sweep(
@@ -105,9 +111,18 @@ def main():
     print(f"\nBest (highest) probability-weighted ratio of mean work to mean jump_second_only:")
     print(f"  {best_by_ratio} -> {best_ratio_value:.4g}")
 
+    best_by_difference, best_difference_value, _ = find_best_parameter_point(
+        sweep_results, metric="weighted_difference_of_means", reference_key="jump_second_only", maximize=True,
+    )
+    print(f"\nBest (highest) probability-weighted difference of mean work and mean jump_second_only:")
+    print(f"  {best_by_difference} -> {best_difference_value:.4g}")
+
+    
+
     # --- Re-run and plot both flagged points in full detail ---
     run_and_report_detail(best_by_work, "the point flagged best by work", params_bath_model, kT)
     run_and_report_detail(best_by_ratio, "the point flagged best by ratio", params_bath_model, kT)
+    run_and_report_detail(best_by_difference, "the point flagged best by difference", params_bath_model, kT)
 
 
 if __name__ == "__main__":

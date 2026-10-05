@@ -231,7 +231,8 @@ class _LivePreview:
 
 
 # ── Independent utilities — each callable on its own, not tied together ────────
-def preview_particle(camera, fps: float = 100.0) -> None:
+def preview_particle(camera, fps: float = 100.0, find_method: str = "fast",
+                     find_smooth_sigma: float = 3) -> None:
     """
     Live preview at `fps` (default well above a real session's decision
     cadence) so you can confirm the particle is actually there before/after
@@ -239,10 +240,20 @@ def preview_particle(camera, fps: float = 100.0) -> None:
     existing free-run preview path (softwareTrigg + startview), independent
     of the hardware-triggered acquisition a real session uses, so it never
     touches — and can't slow down — the session's hot path.
+
+    find_method/find_smooth_sigma: which tracking method draws the cross
+    marker, and (for "gradient") how much it pre-blurs the frame — "fast"
+    (default) or "gradient", same defaults as camera.find()/startview() so
+    what you see here matches what a real session using the same settings
+    would actually track. Purely a visual check here; doesn't affect what
+    any later camera.find() call in this session uses — pass
+    find_method="gradient"/find_smooth_sigma=... to
+    calibrate_trap_center()/run_session_2ch()/run_batch_2ch() separately
+    for that.
     """
     camera.framerate(fps)
     camera.softwareTrigg()
-    camera.startview(particle_cross=True)
+    camera.startview(particle_cross=True, method=find_method, smooth_sigma=find_smooth_sigma)
     input("Particle visible? Press Enter to continue...")
     camera.stopview()
 
@@ -251,7 +262,9 @@ def calibrate_trap_center(camera, duration_s: float = 30.0,
                           fps: float = 100.0,
                           nm_per_px: float = NM_PER_PX,
                           live_preview: bool = True,
-                          savepath: str = "") -> tuple[float, float, np.ndarray]:
+                          savepath: str = "",
+                          find_method: str = "fast",
+                          find_smooth_sigma: float = 3) -> tuple[float, float, np.ndarray]:
     """
     Independent trap-center measurement — run this once (or whenever you
     want to recheck), then pass its result into
@@ -274,6 +287,10 @@ def calibrate_trap_center(camera, duration_s: float = 30.0,
     recovered from camera.find()'s nm output via the same nm_per_px used to
     call it (default: camera.py's own NM_PER_PX), not a second camera call.
     Pass savepath to also write it to "<savepath>_calib_pos_px.npy".
+
+    find_method/find_smooth_sigma are passed straight through to
+    camera.find() ("fast" or "gradient" — see camera.py::find()); default
+    is unchanged ("fast") so existing calls behave exactly as before.
 
     live_preview=True (default) shows the live feed the whole time via
     _LivePreview — fed from this function's own grab() loop (see
@@ -303,7 +320,8 @@ def calibrate_trap_center(camera, duration_s: float = 30.0,
             except RuntimeError:
                 pos_px[i, 2] = t_now
                 continue
-            x_nm, y_nm = camera.find(frame, nm_per_px=nm_per_px)
+            x_nm, y_nm = camera.find(frame, nm_per_px=nm_per_px,
+                                      method=find_method, smooth_sigma=find_smooth_sigma)
             if preview:
                 preview.update(frame, x_nm, y_nm)
 
@@ -417,7 +435,9 @@ def run_session_2ch(params: SessionParams2Ch, ao, ai, camera, funcgen,
                     ao1_start_v: float = V_CENTER,
                     active_states: set[tuple[int, int]] | None = None,
                     live_preview: bool = False,
-                    protocols: dict[tuple[int, int], np.ndarray] | None = None) -> dict:
+                    protocols: dict[tuple[int, int], np.ndarray] | None = None,
+                    find_method: str = "fast",
+                    find_smooth_sigma: float = 3) -> dict:
     """
     Camera dry-run session for the 9-state / two-channel scheme. The stage
     is not physically connected yet — x(t) is a freely-diffusing particle,
@@ -522,6 +542,10 @@ def run_session_2ch(params: SessionParams2Ch, ao, ai, camera, funcgen,
         a silent length mismatch would otherwise let a FINITE AO task
         truncate the waveform without any error (see hw_two_channel_test.py's
         notes on that exact failure mode).
+
+    find_method/find_smooth_sigma: passed straight through to every
+        camera.find() call in the decision loop ("fast" or "gradient" —
+        see camera.py::find()); default is unchanged ("fast").
     """
     if protocols is not None:
         expected_len = int(params.protocol_dt_s * params.ao_rate)
@@ -624,7 +648,7 @@ def run_session_2ch(params: SessionParams2Ch, ao, ai, camera, funcgen,
                 continue
 
             t_find0 = time.perf_counter()
-            x_nm, y_nm = camera.find(frame)
+            x_nm, y_nm = camera.find(frame, method=find_method, smooth_sigma=find_smooth_sigma)
             find_latencies_s.append(time.perf_counter() - t_find0)
             x_nm -= params.x_center_nm
             y_nm -= params.y_center_nm
@@ -808,7 +832,9 @@ def run_batch_2ch(base_kwargs: dict, experiment_overrides: list[dict],
                   aom_gen=None, aom_transit_v: float | None = None,
                   aom_experiment_v: float | None = None,
                   aom_post_ramp_wait_s: float = 10.0,
-                  protocols: dict[tuple[int, int], np.ndarray] | None = None) -> list[dict]:
+                  protocols: dict[tuple[int, int], np.ndarray] | None = None,
+                  find_method: str = "fast",
+                  find_smooth_sigma: float = 3) -> list[dict]:
     """
     Run N experiments back-to-back, camera/DAQ staying open the whole time
     (never closed between experiments) — and this is a genuinely blocking,
@@ -871,6 +897,10 @@ def run_batch_2ch(base_kwargs: dict, experiment_overrides: list[dict],
         placeholder get_protocol_nm() shapes, same as before this
         parameter existed.
 
+    find_method/find_smooth_sigma: passed straight through to every
+        run_session_2ch() call ("fast" or "gradient" — see
+        camera.py::find()); default is unchanged ("fast").
+
     Returns a list of the N run_session_2ch() result dicts, in order.
     """
     n = len(experiment_overrides)
@@ -892,7 +922,8 @@ def run_batch_2ch(base_kwargs: dict, experiment_overrides: list[dict],
         params = SessionParams2Ch(**exp_kwargs, **overrides)
 
         result = run_session_2ch(params, ao, ai, camera, funcgen, ao1_start_v=ao1_v,
-                                 protocols=protocols)
+                                 protocols=protocols,
+                                 find_method=find_method, find_smooth_sigma=find_smooth_sigma)
         ao1_v = result["ao1_final_v"]
 
         DataSync, tvec = build_datasync(result)

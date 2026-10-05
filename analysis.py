@@ -78,7 +78,7 @@ def compute_potential(x_nm: np.ndarray, n_bins: int = 60, T_K: float = 298.0) ->
     # true anharmonic trap deviates from parabolic out there anyway, so
     # including them would bias the quadratic fit away from the harmonic
     # region it's supposed to describe.
-    fit_mask = (U_raw - U_raw.min()) < 5.0
+    fit_mask = (U_raw - U_raw.min()) < 5.5
 
     # Fit on the raw (unshifted) values — an additive constant doesn't
     # affect the quadratic/linear coefficients (stiffness, x0).
@@ -566,7 +566,7 @@ def _finalize_merge(combined: dict, data_key: str = "x_nm") -> dict:
     return out
 
 
-def extract_protocol_events_from_folder(folder: str, states=None) -> dict:
+def extract_protocol_events_from_folder(folder: str, states=None, prefixes=None) -> dict:
     """
     Load every saved session in folder (one run_batch_2ch() batch's worth)
     and pool their extract_protocol_events() results into one combined
@@ -576,9 +576,15 @@ def extract_protocol_events_from_folder(folder: str, states=None) -> dict:
     of 8 separate ones. states=None (default) auto-resolves per-session as
     extract_protocol_events() does (each session's own active_states/
     protocols_loaded), then pools across whatever the union of sessions covers.
+
+    prefixes: None (default) pools every session discover_session_files(folder)
+    finds, same as before this parameter existed. Pass an explicit subset
+    (e.g. a few of discover_session_files(folder)'s own entries) to pool
+    only those - excluding a known-bad run from the analysis without
+    touching its saved files.
     """
     combined: dict = {}
-    for prefix in discover_session_files(folder):
+    for prefix in (prefixes if prefixes is not None else discover_session_files(folder)):
         sess = load_session_files(prefix)
         ev = extract_protocol_events(sess["pos"], sess["params"], states=states,
                                      active_states=sess["active_states"],
@@ -605,7 +611,7 @@ def extract_protocol_events_from_folders(folders, states=None) -> dict:
     return _finalize_merge(combined)
 
 
-def extract_protocol_stage_events_from_folder(folder: str, states=None) -> dict:
+def extract_protocol_stage_events_from_folder(folder: str, states=None, prefixes=None) -> dict:
     """
     Same pooling as extract_protocol_events_from_folder(), but for the
     physical Stage-channel readback (extract_protocol_stage_events()) -
@@ -613,9 +619,13 @@ def extract_protocol_stage_events_from_folder(folder: str, states=None) -> dict:
     raises KeyError-like access if a session is missing one; older saves
     without DataSync should be pointed at extract_protocol_events_from_folder
     instead, or excluded from folder).
+
+    prefixes: same meaning as extract_protocol_events_from_folder()'s -
+    None (default) pools every session in folder; an explicit subset pools
+    only those.
     """
     combined: dict = {}
-    for prefix in discover_session_files(folder):
+    for prefix in (prefixes if prefixes is not None else discover_session_files(folder)):
         sess = load_session_files(prefix)
         if sess["DataSync"] is None:
             raise FileNotFoundError(
@@ -1212,7 +1222,12 @@ def plot_work_split_grid(events: dict, jump_by_state: dict, total_by_state: dict
 
 
 def export_for_matlab(path: str, events: dict, lambdas: dict, works_kT: dict,
-                      kappa_N_per_m: float, T_K: float, protocol_dt_s: float) -> None:
+                      kappa_N_per_m: float, T_K: float, protocol_dt_s: float,
+                      jump_works_kT: dict | None = None,
+                      predicted_work_kT: dict | None = None,
+                      trigger_reference_kT: dict | None = None,
+                      stage_events: dict | None = None,
+                      stage_protocol_nm: dict | None = None) -> None:
     """
     Save the exact arrays plot_x_lambda_grid()/plot_work_grid() plot to one .mat file -
     per state, a struct (MATLAB field names can't hold '(', ',', '-', so
@@ -1223,6 +1238,27 @@ def export_for_matlab(path: str, events: dict, lambdas: dict, works_kT: dict,
         metadata (kappa_N_per_m, T_K, protocol_dt_s) needed to interpret them
         - no need to also ship pos/ai_data; these are the plotted source
         arrays, already in real units (nm, kT), ready to replot directly.
+
+    The remaining params are all optional (None = omit that field entirely,
+    matching every caller before this extension existed) and carry what
+    matlab/InfoEngineAnalysis.m's newer plots (plotTrapRelative/
+    plotWorkSplit/plotStageVsProtocol - the MATLAB equivalents of
+    plot_trap_relative_grid/plot_work_split_grid/plot_stage_vs_protocol_grid)
+    need on top of the base fields above:
+        jump_works_kT        : dict[state] -> (n_events,) W_jump_kT,
+                               compute_work_split_kT()'s first return value
+                               -> saved as W_jump_kT.
+        predicted_work_kT     : dict[state] -> float (kT) -> predicted_work_kT.
+        trigger_reference_kT  : dict[state] -> float (kT) -> trigger_reference_kT.
+        stage_events          : dict[state] -> {"stage_nm", "t_s"} from
+                               extract_protocol_stage_events_from_folder() ->
+                               saved as stage_nm/stage_t_s (its own t_s,
+                               kept separate from the camera-side t_s above
+                               since the two aren't guaranteed to share a
+                               sampling grid).
+        stage_protocol_nm     : dict[state] -> (protocol_frames,) -> saved
+                               as stage_protocol_nm. Only written for a
+                               state when stage_events also has it.
     """
     from scipy.io import savemat
 
@@ -1231,7 +1267,7 @@ def export_for_matlab(path: str, events: dict, lambdas: dict, works_kT: dict,
 
     mat_dict = {}
     for state in events:
-        mat_dict[_field(state)] = {
+        entry = {
             "m0": state[0], "mt": state[1],
             "t_s": events[state]["t_s"],
             "x_nm": events[state]["x_nm"],
@@ -1239,6 +1275,18 @@ def export_for_matlab(path: str, events: dict, lambdas: dict, works_kT: dict,
             "W_cum_kT": works_kT[state],
             "n_events": events[state]["x_nm"].shape[0],
         }
+        if jump_works_kT is not None and state in jump_works_kT:
+            entry["W_jump_kT"] = jump_works_kT[state]
+        if predicted_work_kT is not None and state in predicted_work_kT:
+            entry["predicted_work_kT"] = predicted_work_kT[state]
+        if trigger_reference_kT is not None and state in trigger_reference_kT:
+            entry["trigger_reference_kT"] = trigger_reference_kT[state]
+        if stage_events is not None and state in stage_events:
+            entry["stage_nm"] = stage_events[state]["stage_nm"]
+            entry["stage_t_s"] = stage_events[state]["t_s"]
+            if stage_protocol_nm is not None and state in stage_protocol_nm:
+                entry["stage_protocol_nm"] = stage_protocol_nm[state]
+        mat_dict[_field(state)] = entry
     mat_dict["kappa_N_per_m"] = kappa_N_per_m
     mat_dict["T_K"] = T_K
     mat_dict["protocol_dt_s"] = protocol_dt_s

@@ -448,6 +448,37 @@ def weighted_ratio_of_means(point_results, reference_key="jump_second_only"):
     return float(weighted_numerator / weighted_denominator)
 
 
+def weighted_difference_of_means(point_results, reference_key="jump_second_only"):
+    """
+    Difference of probability-weighted mean optimal work and probability-weighted
+    mean reference work.
+
+    metric = (sum_i P_i * optimal_i) - (sum_i P_i * reference_i)
+
+    Parameters:
+    point_results : dict
+        As returned by evaluate_parameter_point.
+    reference_key : str, optional
+        One of "jump_both", "jump_second_only", "-V_trap". Default
+        "jump_second_only".
+
+    Returns:
+    float
+        (sum_i P_i * optimal_i) - (sum_i P_i * reference_i); NaN if
+        point_results is empty.
+    """
+    if not point_results:
+        return np.nan
+    probabilities = np.array([v["probability"] for v in point_results.values()])
+    optimals = np.array([v["optimal"] for v in point_results.values()])
+    references = np.array([v[reference_key] for v in point_results.values()])
+
+    weighted_numerator = np.sum(probabilities * optimals)
+    weighted_denominator = np.sum(probabilities * references)
+
+    return float(-(weighted_numerator - weighted_denominator))
+
+
 def find_best_parameter_point(sweep_results, metric="weighted_mean_work",
                                work_key="optimal", reference_key="jump_second_only",
                                maximize=True):
@@ -488,8 +519,10 @@ def find_best_parameter_point(sweep_results, metric="weighted_mean_work",
         metric_fn = lambda r: weighted_mean_ratio(r, reference_key)
     elif metric == "weighted_ratio_of_means":
         metric_fn = lambda r: weighted_ratio_of_means(r, reference_key)
+    elif metric == "weighted_difference_of_means":
+            metric_fn = lambda r: weighted_difference_of_means(r, reference_key)
     else:
-        raise ValueError(f"Unknown metric {metric!r}; choose 'weighted_mean_work', 'weighted_mean_ratio' or 'weighted_ratio_of_means'")
+        raise ValueError(f"Unknown metric {metric!r}; choose 'weighted_mean_work', 'weighted_mean_ratio', 'weighted_ratio_of_means' or 'weighted_difference_of_means'")
 
     all_values = {point: metric_fn(results) for point, results in sweep_results.items()}
     valid = {p: v for p, v in all_values.items() if not np.isnan(v)}
